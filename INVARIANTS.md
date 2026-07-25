@@ -26,28 +26,34 @@
 
 ## Release / propagation
 
-<!-- prompt: what version-bearing files must stay in sync? what's the ship gate? -->
+- **Version lives in `Cargo.toml` only** — **PROSE**. Single version source; README installation text must not name a version. Graduate: when the release pipeline (issue #5, cargo-dist) lands, add a tag↔Cargo.toml version consistency check.
 
 ## Contracts (the cross-surface edges)
 
-<!-- prompt: what API/schema shapes ripple across surfaces? what's the envelope contract? -->
+- **`--log` JSONL schema is append-only** — **PROSE**. One JSON object per line; sample lines carry `ts`/`host`/`rtt_ms|null`, event lines carry `ts`/`host`/`event` (+`duration_ms` on `outage_end`); `ts` is epoch milliseconds. Consumers parse by field presence. Fields may be added; existing fields must never be renamed, retyped, or re-scaled — overnight recordings and downstream scripts depend on it. The README documents the schema; keep them in lockstep. Graduate: schema round-trip test against the documented examples.
+- **Hook env vars are a published contract** — **PROSE**. `EKG_HOST`, `EKG_OUTAGE_START` (epoch ms, same clock/format as the recorder's `ts`), `EKG_OUTAGE_SECS` (whole seconds, recovery only). Reserved `EKG_*` names are scrubbed from the inherited environment before event vars are applied (covered by `hooks::tests`). Renaming or re-scaling any of these breaks user scripts. Implicit: scrub + construction are unit-tested; the naming contract itself is prose.
+- **Exit codes are semantic** — **PROSE**. `--count` runs exit 0 iff every target's lifetime loss ≤ `--max-loss`, else 1; invalid CLI usage exits 2 (clap). Health checks and cron jobs script against these. Partially covered by `loss_within_threshold` and `parse_max_loss` unit tests. Graduate: integration test running the built binary end-to-end.
 
 ## Runtime
 
-<!-- prompt: what concurrency / process / connection / resource invariants must hold? -->
+- **The ping loop never blocks on side effects** — **PROSE**. Hooks are spawned detached; recorder writes are the only synchronous I/O added to the event path and must stay O(one line + flush). A hung hook, full disk, or slow filesystem must never stop pings or panel redraws. Implicit: partially covered by `hooks::tests` timeout/reap tests.
+- **Hook process trees are bounded and self-terminating** — **ENFORCED** by `hooks::tests` (group-kill, TERM-immune-child, and dash-wrapper tests; graduated during issue #4 / PR #11). The 30s timeout is enforced *inside* the hook's own process tree, so it holds even after ekg exits; completion sweeps TERM → grace → group KILL; single-flight is per target per hook kind.
+- **Shell wrappers must work under dash, not just bash** — **ENFORCED** by `hooks::tests::hook_wrapper_group_kill_works_under_dash` and siblings (PR #11; dash's builtin `kill` rejects `--` before a negative pgid). Any new `sh -c` script ekg ships needs a dash-exercising test.
+- **The terminal is always restored** — **PROSE**. Cursor visibility and line wrap are restored on every exit path: RAII `Drop` on `Display` for normal/error returns, explicit `restore_cursor()` before each `std::process::exit`. `restore_cursor` is idempotent. A new `process::exit` call site must restore first — `Drop` never runs under `process::exit`. Graduate: PTY-based integration test.
+- **No sudo, ever** — **PROSE**. ICMP via unprivileged datagram sockets only. A feature that needs raw sockets or setuid is out of scope; it would break the README's core promise. Implicit: enforced by the socket type the code uses; no check needed unless a second socket call site appears.
 
 ## Secrets / configuration
 
-<!-- prompt: which secrets live where? what's the boundary nobody crosses? -->
+- **ekg holds no secrets** — **PROSE**. No config files, no tokens, no network calls except ICMP to the user-named hosts. Hook commands run with the *user's* environment by design (minus reserved `EKG_*` vars). Implicit: nothing to scrub beyond the reserved-var scrub already tested.
 
 ## CI / dev workflow
 
-<!-- prompt: what must pass before a change can merge? -->
+- **CI must be green on macOS and Linux before merge** — **ENFORCED** by branch protection on `main` requiring both `build + test` checks (added 2026-07-25). Linux CI is the only pre-merge surface where dash-`/bin/sh` behavior is exercised; never skip it.
+- **CI stays on GitHub-hosted runners** — **PROSE**. ekg is a public repo accepting untrusted PRs; per the operator's standing self-hosted-runner policy, its CI must never move to the NAS/self-hosted runners. Implicit: workflow files name `macos-latest`/`ubuntu-latest`; revisit only if a workflow edit proposes a `runs-on` change.
+- **Every PR passes the Codex correctness gate before merge** — **PROSE**. `scripts/codex_review.py --dry-run` via `/fctry:review-pr`; Codex-green is the merge signal, operator selection is the authorization. Lived experience: PRs #10/#11 took 3 and 6 rounds respectively, every finding real. Graduate: candidate for a merge-time attestation once the loop has more cycles here.
+- **Zero clippy warnings, rustfmt clean, all tests green locally before push** — **PROSE**. `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`. Subprocess-lifecycle tests must additionally survive 10 consecutive full-suite runs (flake bar established during PR #11). Implicit: CI enforces the first three; the 10x flake bar is convention.
 
 ## Open tensions (NOT invariants — tracked drift to resolve)
 
-<!-- prompt: what's currently broken or inconsistent and needs to converge? -->
-
-<!-- Add project-specific sections below (e.g. "Spaces / governance", "Extraction / render",
-     "Observability / privacy", "Hosted / multi-user"). See knowmarks/INVARIANTS.md for the
-     proven shape of a populated file. -->
+- The README's "four dependencies" line is load-bearing prose — recount it whenever Cargo.toml changes (feature additions to existing crates are fine; new crates need a reason and a README edit).
+- Issue #5 (release pipeline) will add version-bearing files (Homebrew formula, install script); revisit the "version lives in Cargo.toml only" entry when it lands.
