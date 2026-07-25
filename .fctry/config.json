@@ -1,0 +1,15 @@
+{
+  "formatVersion": "1.1.3",
+  "versions": {
+    "external": {
+      "type": "external",
+      "current": "0.1.0",
+      "propagationTargets": [],
+      "incrementRules": {
+        "patch": "auto-per-chunk",
+        "minor": "suggest-at-plan-completion",
+        "major": "suggest-at-experience-milestone"
+      }
+    }
+  }
+}

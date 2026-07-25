@@ -1,0 +1,87 @@
+# fctry .fctry/ track-vs-ignore policy — CANONICAL SOURCE OF TRUTH.
+#
+# This file is the single declared contract for which .fctry/ paths git
+# TRACKS (durable source-of-truth) and which it IGNORES (ephemeral). It is
+# copied verbatim into a project's .fctry/.gitignore at init
+# (scripts/init-agent-model.sh) and create-OR-reconciled on every prompt by the
+# migrate hook (hooks/migrate.sh — create_gitignore when absent, gitignore-policy.js
+# reconcileGitignore when present-but-stale; cycle 131 / GH #249). The reader, the
+# canonical-pattern lists, the drift check, and the reconcile writer live in
+# src/process/gitignore-policy.js; doctor
+# Check 46 (scripts/verify-gitignore-policy.sh) verifies a project's
+# .fctry/.gitignore against this contract. Mirrors how cycle 90 / GH #138
+# lifted the phase model into src/process/default-process.json +
+# src/process/load.js (cycle 115 / GH #140, subsumes #191).
+#
+# ── TRACKED (canonical durable source-of-truth) ──────────────────────────
+# Git tracks these .fctry/ paths; they are the operational state every
+# session reads against and reconciles. Do NOT add ignore lines for them.
+#   config.json              version registry + format version
+#   lessons.md               cross-session learnings (candidate → active)
+#   process.json             declared phase model (cycle 90 / GH #138)
+#   routing.json             declared model-routing policy (cycle 124 / GH #172 #173)
+#   audits/                  conformance audits
+#   cycles/<N>/{diagnose,scope,build,close}.md   phase artifacts
+#   refs/<UTC>-<slug>.json   research_verdict artifacts (/fctry:ref)
+#   steward.json             /close steward marker + sha-chain
+#   harvest-watermark.json   cross-repo harvest cursor (durable — loss forces
+#                            a full re-scan; body-marker dedupe keeps it safe
+#                            but not free; see scripts/harvest-fctry-core.sh)
+#   launchd/com.fctry.harvest.plist   in-repo LaunchAgent source-of-truth
+#   m4-pro/                  m4-pro worker scripts (install-m4-pro-*.sh deploys)
+#   agent-model-init         init-agent-model.sh sentinel
+#   substrate-tier           init-substrate.sh sentinel
+#   legacy-spec-era/         migration archive of legacy spec-era files
+#   no-session-handoff, no-statusline, no-orchestrator-edit-guard,
+#     no-summary-surface, no-stuck-loop, and any future no-* opt-out sentinels
+#   .gitignore               this file itself
+#
+# ── LEGACY / project-shape (tracked when present; migration-era) ─────────
+# Carried for projects mid-migration; not written fresh by fctry-next.
+#   spec.db, architecture.md, viewer/, doom-loop-state.json,
+#   build-trace-*.md, interview-state.md
+#
+# ── IGNORED (always ephemeral) ───────────────────────────────────────────
+# The lines below are the ignore body. Project-specific additions are
+# allowed beneath the canonical block: doctor Check 46 passes silently on
+# additions, WARNS on a missing canonical entry (drift), and FAILS on a
+# missing canonical-REQUIRED body entry OR a missing TRACKED-file entry in
+# the header block above (cycle 128 / GH #256). The required/recommended
+# split lives in src/process/gitignore-policy.js, not in this file's comments.
+#
+# When this set GROWS, existing adopters self-heal: hooks/migrate.sh reconciles
+# a present-but-stale .fctry/.gitignore on the next prompt (append the new
+# patterns, refresh a drifted header) via gitignore-policy.js reconcileGitignore
+# — no hand-editing (cycle 131 / GH #249). So adding a line here propagates to
+# every adopter automatically; you don't have to touch their copies.
+
+# --- canonical-required (must be ignored; doctor fails if missing) ---
+state.json
+inbox.json
+session-handoff.md
+.context-state.json
+sessions/
+coordination/
+.migration-policy.json
+*.db-shm
+*.db-wal
+
+# --- canonical-recommended (doctor warns if missing) ---
+tool-check
+plugin-root
+resume-index.json
+pre-compact-snapshot.json
+quality-baseline.json
+# canonical loop-state projection (src/process/loop-state.js, GH #282) — derived view
+loop-state.json
+# stuck-loop detector's session-runtime ring buffer (hooks/stuck-loop-detect.js, GH #228)
+stuck-state.json
+.cache/
+autonomous
+cycles/*/fixtures/proj/
+wave/
+.summary-surfaced
+.summary-surface-challenge
+# per-cycle fire-once diagnose-hook sentinels (.diagnose-{inbox-drain,km-pulse,km-search}-fired-<N>)
+.diagnose-*-fired-*
+.DS_Store
