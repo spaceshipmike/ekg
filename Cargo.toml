@@ -1,0 +1,17 @@
+[package]
+name = "ekg"
+version = "0.1.0"
+edition = "2021"
+description = "Compact in-place ping monitor that updates a status panel instead of scrolling"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/spaceshipmike/ekg"
+
+[[bin]]
+name = "ekg"
+path = "src/main.rs"
+
+[dependencies]
+surge-ping = "0.8"
+tokio = { version = "1", features = ["rt", "time", "signal", "macros"] }
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
