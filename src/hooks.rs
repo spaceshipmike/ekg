@@ -59,12 +59,32 @@ const HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 /// group leader (`process_group(0)`, set by [`spawn_hook_with_timeout`]).
 /// It backgrounds the user's command, backgrounds a watchdog subshell that
 /// sleeps for the timeout and then sends `SIGKILL` to the *entire process
-/// group* (`kill -KILL -- -$$`, negative pgid) — which, because everything
-/// in the tree inherited the same pgid, takes down the user command and any
+/// group* (`kill -KILL -$$`, negative pgid) — which, because everything in
+/// the tree inherited the same pgid, takes down the user command and any
 /// children/grandchildren it spawned along with the wrapper and the
 /// watchdog itself. That kill happens from a process that's part of the
 /// hook's own tree, independent of ekg's tokio runtime or even ekg still
 /// existing, so it fires whether or not ekg is still around to see it.
+///
+/// **No `--` before the negative pgid.** `kill -KILL -- -$$` (with the
+/// POSIX "end of options" marker, the obvious/conventional way to write
+/// this) is what an earlier revision shipped, and it's flatly broken under
+/// `dash` — confirmed directly, not guessed: `dash`'s builtin `kill` fails
+/// that exact invocation with `Illegal number: -` and never signals
+/// anything, while the *identical* script minus `--` (`kill -KILL -$$`)
+/// signals the group correctly. `dash` is `/bin/sh` on Debian/Ubuntu (this
+/// wrapper's whole reason to exist is running as portable POSIX `sh`, and
+/// `sh` on most Linux distros *is* `dash`), so this wasn't a hypothetical —
+/// it silently broke the entire timeout/group-kill guarantee on Linux while
+/// working fine in local dev on macOS (`/bin/sh` there is `bash`, which
+/// parses the `--` form without complaint). `bash` accepts *both* forms
+/// identically, so dropping `--` is not a trade-off between the two shells
+/// — it is simply the form that works everywhere. There's no real ambiguity
+/// risk from omitting it here either: once `-KILL`/`-TERM` has already been
+/// consumed as the signal, the remaining `-$$` is the only positional
+/// argument left, which is exactly the conventional `kill -SIGNAL -pgid`
+/// idiom every `kill` implementation (dash's builtin, bash's builtin, and
+/// the external `/bin/kill`) supports as its primary process-group form.
 ///
 /// The *normal completion* path (the user command finishes before the
 /// timeout) needs its own cleanup, and an earlier revision of this wrapper
@@ -85,7 +105,7 @@ const HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 /// status, it runs `trap '' TERM` (makes itself immune to `SIGTERM` — it's
 /// about to send that signal to its own group next, and would otherwise
 /// kill itself before it can report the right exit status) and then
-/// `kill -TERM -- -$$` (every remaining process sharing this group — the
+/// `kill -TERM -$$` (every remaining process sharing this group — the
 /// stray backgrounded child, the watchdog's orphaned `sleep`, anything
 /// else — dies; the trap is what lets the wrapper itself survive that same
 /// broadcast). Only then does it `exit` with the captured status. The
@@ -107,7 +127,7 @@ const HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 ///   - `$3` = timeout in seconds, as text (fractional allowed, e.g. `"0.05"`
 ///     — used by tests; production always passes [`HOOK_TIMEOUT`], which
 ///     formats as a plain integer, see `hook_timeout_formats_as_plain_integer_seconds`)
-const HOOK_WRAPPER: &str = r#""$1" -c "$2" & u=$!; ( sleep "$3"; kill -KILL -- -$$ ) 2>/dev/null & w=$!; wait "$u"; s=$?; kill "$w" 2>/dev/null; trap '' TERM; kill -TERM -- -$$ 2>/dev/null; exit "$s""#;
+const HOOK_WRAPPER: &str = r#""$1" -c "$2" & u=$!; ( sleep "$3"; kill -KILL -$$ ) 2>/dev/null & w=$!; wait "$u"; s=$?; kill "$w" 2>/dev/null; trap '' TERM; kill -TERM -$$ 2>/dev/null; exit "$s""#;
 
 /// Owns the single-flight state for one target's `--on-outage` /
 /// `--on-recovery`. `main` creates one `Hooks` per monitored target (it
@@ -268,7 +288,7 @@ fn spawn_hook_with_timeout(
 ) -> Option<u32> {
     let user_shell = resolve_shell(std::env::var("SHELL").ok());
     // The wrapper is always run via plain `sh`, not the user's `$SHELL` —
-    // its own syntax (backgrounding, `wait pid`, `kill -- -$$`) is
+    // its own syntax (backgrounding, `wait pid`, `kill -$$`) is
     // deliberately kept to portable POSIX `sh` so it behaves the same
     // regardless of what shell the user has configured; `$SHELL` is only
     // used *inside* the wrapper, to run the user's actual command as
@@ -302,7 +322,7 @@ fn spawn_hook_with_timeout(
     // the user disconnects and most wants it to keep running.
     // `process_group(0)` makes the wrapper its own group leader instead,
     // which doubles as the mechanism HOOK_WRAPPER's internal timeout (and
-    // completion-path cleanup) use to reach its whole tree (`kill -- -$$`
+    // completion-path cleanup) use to reach its whole tree (`kill -$$`
     // targets this same group). Unix-only API; ekg only ships for
     // macOS/Linux (see README/CI), so no other-platform fallback is
     // needed. tokio::process::Command defines `process_group` natively
@@ -616,6 +636,111 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Whether a `dash` binary is available on `PATH`. Not guaranteed on
+    /// every dev machine (it happens to ship by default on macOS, and is
+    /// `/bin/sh` on Debian/Ubuntu — installable via `brew install
+    /// dash-shell` on macOS or already present on most Linux systems), so
+    /// the dash-specific regression test below skips itself gracefully
+    /// when it's absent rather than failing. The authoritative signal for
+    /// a dash-specific regression is Ubuntu CI, which always has `dash` as
+    /// `/bin/sh`; this test exists so the *same* class of bug is also
+    /// catchable in local dev on any machine that happens to have `dash`
+    /// installed, without requiring it.
+    #[cfg(unix)]
+    fn dash_available() -> bool {
+        std::process::Command::new("dash")
+            .arg("-c")
+            .arg("true")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Regression test for the exact bug a round-4 Codex review caught on
+    /// Ubuntu CI (and this test suite's own 30s budgets did NOT catch
+    /// locally, because local dev here runs on macOS where `/bin/sh` is
+    /// `bash`): `HOOK_WRAPPER`'s group-kill line used to read
+    /// `kill -KILL -- -$$` — with the POSIX "end of options" `--` marker
+    /// before the negative pgid, the obvious/conventional way to write it —
+    /// and that is silently broken under `dash`'s **builtin** `kill`.
+    /// Confirmed directly (not guessed) by running the exact line under
+    /// `dash`: it fails with `dash: kill: Illegal number: -` and signals
+    /// nothing, while the identical command minus `--` works correctly.
+    /// `dash` is `/bin/sh` on Debian/Ubuntu, so every hook's timeout/
+    /// group-kill guarantee was silently non-functional there.
+    ///
+    /// This spawns `HOOK_WRAPPER` through `dash` directly — bypassing
+    /// `spawn_hook_with_timeout`'s hardcoded `Command::new("sh")`, which on
+    /// this dev machine resolves to `bash` and would hide the bug — using
+    /// the exact same repro Codex reported (`sleep 60 &`, a user command
+    /// that backgrounds a child and returns immediately) to prove the fix
+    /// (dropping `--`) actually works under the shell that broke it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hook_wrapper_group_kill_works_under_dash() {
+        if !dash_available() {
+            eprintln!(
+                "skipping hook_wrapper_group_kill_works_under_dash: no `dash` on PATH \
+                 (install with `brew install dash-shell` on macOS to run this locally; \
+                 Ubuntu CI always has it as /bin/sh)"
+            );
+            return;
+        }
+        let _guard = process_test_lock().lock().await;
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("ekg-hook-dash-repro-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        // Mirrors spawn_hook_with_timeout's own argv construction, except
+        // the top-level interpreter is forced to `dash` regardless of what
+        // `sh` resolves to on this machine.
+        let cmd = format!("sleep 60 & echo $! > {}", path.display());
+        let mut command = Command::new("dash");
+        command
+            .arg("-c")
+            .arg(HOOK_WRAPPER)
+            .arg("sh") // $0 — conventional, unused
+            .arg("sh") // $1 — the user command's own shell; plain sh is enough here
+            .arg(&cmd) // $2
+            .arg("30") // $3 — long timeout; only the completion-path sweep should matter
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        command.process_group(0);
+
+        let mut child = command
+            .spawn()
+            .expect("dash should be spawnable — dash_available() already checked");
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+        });
+
+        let recorded = poll_until(TEST_POLL_BUDGET, || {
+            std::fs::read_to_string(&path)
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+        })
+        .await;
+        assert!(recorded, "backgrounded child's pid was never recorded");
+        let bg_pid: u32 = std::fs::read_to_string(&path)
+            .unwrap()
+            .trim()
+            .parse()
+            .expect("recorded pid should be a plain integer");
+
+        let dead = poll_until(TEST_POLL_BUDGET, || !pid_alive(bg_pid)).await;
+        assert!(
+            dead,
+            "backgrounded child (pid {bg_pid}) survived under dash — this is the exact bug \
+             Ubuntu CI caught (`kill -- -$$` silently failing under dash's builtin kill)"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Lists the pids of every process currently in process group `pgid`,
     /// via `ps -A -o pid=,pgid=` (all processes, no headers). `-A` (not
     /// `-e`) specifically: `-e` means "all processes" on GNU `ps` but means
@@ -649,7 +774,7 @@ mod tests {
     /// and returns without waiting on it, so the wrapper's own `wait "$u"`
     /// returns almost immediately even though that grandchild is still
     /// running. Before HOOK_WRAPPER grew its trailing
-    /// `trap '' TERM; kill -TERM -- -$$`, that grandchild would survive
+    /// `trap '' TERM; kill -TERM -$$`, that grandchild would survive
     /// the hook's own completion entirely and only die (if ever) when the
     /// full timeout elapsed. A long (30s) timeout is used deliberately so
     /// the *timeout* path can't be what's killing it here — if the
