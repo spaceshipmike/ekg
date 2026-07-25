@@ -43,7 +43,8 @@ struct Args {
 
     /// Send this many pings per target, then print the summary and exit
     /// (instead of running until Ctrl-C). Exit code reflects whether loss
-    /// stayed within --max-loss.
+    /// stayed within --max-loss. `--count 0` sends nothing and exits
+    /// immediately (0/0 loss counts as a pass).
     #[arg(short = 'c', long)]
     count: Option<u64>,
 
@@ -108,6 +109,25 @@ impl TargetRuntime {
 async fn main() -> std::io::Result<()> {
     let args = Args::parse();
 
+    // --count 0: nothing to send, so there's nothing to wait on either.
+    // Handled before any host resolution, client/socket creation, or
+    // terminal setup so it's truly immediate and never touches the
+    // network. Loss is 0/0 == 0.0%, which is a pass against any
+    // non-negative --max-loss (the default 0.0 included).
+    if args.count == Some(0) {
+        let session_start = Instant::now();
+        let targets: Vec<TargetRuntime> = args
+            .hosts
+            .iter()
+            .map(|h| TargetRuntime::new(h.clone(), args.window, session_start))
+            .collect();
+        print_summary(&targets, session_start);
+        let ok = targets
+            .iter()
+            .all(|t| loss_within_threshold(t.stats.lifetime_loss_pct(), args.max_loss));
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+
     let mut resolved: Vec<(String, IpAddr)> = Vec::with_capacity(args.hosts.len());
     for host in &args.hosts {
         match resolve_host(host) {
@@ -171,7 +191,15 @@ async fn main() -> std::io::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<TaggedEvent>(32.max(8 * resolved.len()));
     let (death_tx, mut death_rx) = tokio::sync::mpsc::channel::<usize>(resolved.len().max(1));
     for (idx, ((_, ip), client)) in resolved.iter().zip(clients.into_iter()).enumerate() {
-        pinger::spawn(client, *ip, interval, idx, tx.clone(), death_tx.clone());
+        pinger::spawn(
+            client,
+            *ip,
+            interval,
+            idx,
+            args.count,
+            tx.clone(),
+            death_tx.clone(),
+        );
     }
     drop(tx);
     drop(death_tx);
