@@ -77,7 +77,11 @@ async fn main() -> std::io::Result<()> {
     std::panic::set_hook(Box::new(move |info| {
         let mut out = std::io::stdout();
         use std::io::Write;
-        let _ = crossterm::execute!(out, crossterm::cursor::Show);
+        let _ = crossterm::execute!(
+            out,
+            crossterm::cursor::Show,
+            crossterm::terminal::EnableLineWrap
+        );
         let _ = out.flush();
         default_hook(info);
     }));

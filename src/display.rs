@@ -8,7 +8,7 @@ use std::time::Duration;
 use crossterm::{
     cursor,
     style::{Color, Print, ResetColor, SetForegroundColor},
-    terminal::{Clear, ClearType},
+    terminal::{self, Clear, ClearType, DisableLineWrap, EnableLineWrap},
     QueueableCommand,
 };
 
@@ -87,15 +87,23 @@ impl Display {
         }
     }
 
+    /// Terminal setup for in-place rendering: hides the cursor AND disables
+    /// line wrapping. Wrap must be off while the panel is live — a wrapped
+    /// panel line occupies more physical rows than the renderer's logical
+    /// line count, so cursor-up repositioning drifts and the panel smears
+    /// duplicate rows down the screen in narrow terminals.
     pub fn hide_cursor(&mut self) -> std::io::Result<()> {
-        stdout().queue(cursor::Hide)?.flush()?;
+        stdout().queue(cursor::Hide)?.queue(DisableLineWrap)?.flush()?;
         self.hidden_cursor = true;
         Ok(())
     }
 
     pub fn restore_cursor(&mut self) {
         if self.hidden_cursor {
-            let _ = stdout().queue(cursor::Show).and_then(|s| s.flush());
+            let _ = stdout()
+                .queue(cursor::Show)
+                .and_then(|s| s.queue(EnableLineWrap))
+                .and_then(|s| s.flush());
             self.hidden_cursor = false;
         }
     }
@@ -179,12 +187,20 @@ impl Display {
             out.queue(ResetColor)?;
         } else {
             let last_ms = avg.map(fmt_ms).unwrap_or_else(|| "--".to_string());
-            let buckets = stats.sparkline_buckets(spark_count);
+
+            // Shrink the sparkline to the columns actually available so the
+            // panel stays useful (not clipped) in narrow panes. Wrap is
+            // disabled, so an over-long line would clip, never corrupt.
+            let width = terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
+            let prefix = format!(" {host}   {last_ms}   ");
+            let available = width.saturating_sub(prefix.chars().count() + 2);
+            let effective_spark = spark_count.min(available);
+            let buckets = stats.sparkline_buckets(effective_spark.max(1));
 
             out.queue(SetForegroundColor(color))?;
             out.queue(Print("●"))?;
             out.queue(ResetColor)?;
-            out.queue(Print(format!(" {host}   {last_ms}   ")))?;
+            out.queue(Print(prefix))?;
             for b in &buckets {
                 match b {
                     Some(level) => {
