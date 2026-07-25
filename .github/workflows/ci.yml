@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo build --release
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: cargo build --release
+
+      - name: cargo test
+        run: cargo test
+
+      - name: Configure unprivileged ping (Linux)
+        if: runner.os == 'Linux'
+        run: sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+
+      - name: Ping smoke test (unprivileged DGRAM ICMP, 127.0.0.1)
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          OUT="$(mktemp)"
+          ./target/release/ekg 127.0.0.1 -i 0.2 > "$OUT" 2>&1 &
+          PID=$!
+
+          # Let it collect a few replies, then stop it by PID (never by
+          # process name) — `timeout` isn't available by default on macOS
+          # runners, so this background+sleep+kill is the portable stand-in.
+          sleep 3
+          kill "$PID" 2>/dev/null || true
+          wait "$PID" 2>/dev/null || true
+
+          echo "---- raw ekg output ----"
+          cat "$OUT"
+
+          # ekg writes ANSI cursor/color codes to stdout even when it isn't
+          # attached to a tty, so strip escape sequences before grepping.
+          CLEAN="$(sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' "$OUT")"
+
+          if ! echo "$CLEAN" | grep -Eq '[0-9]+ms'; then
+            echo "No RTT reading (pattern [0-9]+ms) found in ekg output"
+            exit 1
+          fi
+
+          echo "RTT reading found — unprivileged ping path confirmed"
