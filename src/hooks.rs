@@ -65,10 +65,37 @@ const HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 /// watchdog itself. That kill happens from a process that's part of the
 /// hook's own tree, independent of ekg's tokio runtime or even ekg still
 /// existing, so it fires whether or not ekg is still around to see it.
-/// Once the user command finishes on its own, the wrapper cancels the
-/// watchdog and exits with the user command's exit status; ekg's side then
-/// only needs a plain `child.wait()` on the wrapper process — the tree
-/// bounds and terminates itself.
+///
+/// The *normal completion* path (the user command finishes before the
+/// timeout) needs its own cleanup, and an earlier revision of this wrapper
+/// got it wrong: it cancelled the watchdog and exited immediately, which
+/// left two kinds of stragglers alive in the group after the wrapper
+/// itself was gone —
+///
+/// - a user command that backgrounds its own child and doesn't wait on it
+///   (`sleep 60 &` finishes the `-c` invocation instantly, `u` exits right
+///   away, but the backgrounded `sleep 60` is still running);
+/// - the watchdog subshell's own `sleep "$3"` — `kill "$w"` stops the
+///   *subshell* but not the external `sleep` process it already forked as
+///   its own child, which then just lives out its full timeout duration as
+///   an orphan even though the hook itself is long done.
+///
+/// Fixed by having the wrapper sweep its *entire* group on the way out,
+/// not just cancel the watchdog: after capturing the user command's exit
+/// status, it runs `trap '' TERM` (makes itself immune to `SIGTERM` — it's
+/// about to send that signal to its own group next, and would otherwise
+/// kill itself before it can report the right exit status) and then
+/// `kill -TERM -- -$$` (every remaining process sharing this group — the
+/// stray backgrounded child, the watchdog's orphaned `sleep`, anything
+/// else — dies; the trap is what lets the wrapper itself survive that same
+/// broadcast). Only then does it `exit` with the captured status. The
+/// timeout path is unaffected by any of this: `SIGKILL` can't be trapped,
+/// so when the watchdog fires, the whole group (wrapper included) dies
+/// instantly and none of this trailing cleanup code ever runs — it isn't
+/// needed there, since the group kill already got everything.
+///
+/// Either way, ekg's side only needs a plain `child.wait()` on the wrapper
+/// process — the tree bounds, cleans up after, and terminates itself.
 ///
 /// Positional args, passed to `sh -c` as separate argv entries — never
 /// interpolated into this script's text — so arbitrary bytes in the user's
@@ -78,8 +105,9 @@ const HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 ///   - `$1` = the shell that runs the user's command (`$SHELL`, or `sh`)
 ///   - `$2` = the user's command string, passed verbatim to `"$1" -c`
 ///   - `$3` = timeout in seconds, as text (fractional allowed, e.g. `"0.05"`
-///     — used by tests; production always passes [`HOOK_TIMEOUT`])
-const HOOK_WRAPPER: &str = r#""$1" -c "$2" & u=$!; ( sleep "$3"; kill -KILL -- -$$ ) 2>/dev/null & w=$!; wait "$u"; s=$?; kill "$w" 2>/dev/null; exit "$s""#;
+///     — used by tests; production always passes [`HOOK_TIMEOUT`], which
+///     formats as a plain integer, see `hook_timeout_formats_as_plain_integer_seconds`)
+const HOOK_WRAPPER: &str = r#""$1" -c "$2" & u=$!; ( sleep "$3"; kill -KILL -- -$$ ) 2>/dev/null & w=$!; wait "$u"; s=$?; kill "$w" 2>/dev/null; trap '' TERM; kill -TERM -- -$$ 2>/dev/null; exit "$s""#;
 
 /// Owns the single-flight state for one target's `--on-outage` /
 /// `--on-recovery`. `main` creates one `Hooks` per monitored target (it
@@ -162,6 +190,20 @@ fn to_ms(t: SystemTime) -> u128 {
     t.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()
 }
 
+/// Every `EKG_*` var this module ever sets on a hook's environment.
+/// Explicitly removed from the child's environment (see
+/// `spawn_hook_with_timeout`) before applying whichever of them are
+/// actually relevant to *this* invocation — otherwise a hook simply
+/// inherits ekg's own process environment as-is, and a stray reserved var
+/// already present there (most plausibly `EKG_OUTAGE_SECS=999 ekg
+/// --on-outage ...`, but any of these) would leak through unchanged into
+/// an invocation that never meant to set it. `--on-outage` in particular
+/// only ever passes `EKG_HOST`/`EKG_OUTAGE_START` (see `outage_env`) —
+/// `EKG_OUTAGE_SECS` is documented as recovery-only, so a hook script
+/// checking for its presence to decide "is this an outage or a recovery"
+/// must never see a leftover value from somewhere else.
+const RESERVED_ENV_VARS: [&str; 3] = ["EKG_HOST", "EKG_OUTAGE_START", "EKG_OUTAGE_SECS"];
+
 /// Resolves which shell runs hook commands, given the current `$SHELL` env
 /// var (or lack of one). Pulled out as a pure function of its input — rather
 /// than reading `std::env::var` directly — so the fallback behavior is
@@ -197,24 +239,33 @@ fn fire(cmd: &str, env: &[(String, String)], running: Arc<AtomicBool>) {
     if !should_fire(previously_running) {
         return;
     }
-    spawn_hook_with_timeout(cmd, env, running, HOOK_TIMEOUT);
+    // The wrapper pid is only useful to tests inspecting the process group
+    // from outside; production has no need for it.
+    let _ = spawn_hook_with_timeout(cmd, env, running, HOOK_TIMEOUT);
 }
 
 /// Spawns [`HOOK_WRAPPER`] (which in turn runs `cmd` via `$SHELL -c`,
 /// falling back to `sh -c` if `$SHELL` is unset), with `env` applied on top
-/// of the inherited environment, detached from the ping loop in its own
+/// of the inherited environment (after first scrubbing any of
+/// [`RESERVED_ENV_VARS`] that ekg's own environment happened to have set —
+/// see that constant's doc comment), detached from the ping loop in its own
 /// process group. Must be called from within a Tokio runtime (it is, from
 /// `apply_event`, itself always called from the async main loop).
 ///
 /// Spawn failures (bad `$SHELL`, command not found, etc.) are silently
 /// dropped rather than surfaced — a broken hook must never crash ekg or
 /// print anything that would corrupt the panel, mirroring "never block".
+///
+/// Returns the wrapper process's pid if it spawned successfully — unused by
+/// production (`fire` doesn't care), but useful to tests that need to
+/// inspect the hook's process group from outside (that pid *is* the
+/// group's pgid, since the group leader's pgid always equals its own pid).
 fn spawn_hook_with_timeout(
     cmd: &str,
     env: &[(String, String)],
     running: Arc<AtomicBool>,
     timeout: Duration,
-) {
+) -> Option<u32> {
     let user_shell = resolve_shell(std::env::var("SHELL").ok());
     // The wrapper is always run via plain `sh`, not the user's `$SHELL` —
     // its own syntax (backgrounding, `wait pid`, `kill -- -$$`) is
@@ -233,6 +284,14 @@ fn spawn_hook_with_timeout(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    // Scrub every reserved var first, then apply this invocation's actual
+    // set — order matters: if `env` ever legitimately included one of
+    // these (it always does; `env` is `outage_env`/`recovery_env`'s
+    // output), the explicit `.env()` below must win over the blanket
+    // removal, not the other way around.
+    for var in RESERVED_ENV_VARS {
+        command.env_remove(var);
+    }
     for (k, v) in env {
         command.env(k, v);
     }
@@ -242,20 +301,21 @@ fn spawn_hook_with_timeout(
     // truncating a slow notification or a power-cycle command exactly when
     // the user disconnects and most wants it to keep running.
     // `process_group(0)` makes the wrapper its own group leader instead,
-    // which doubles as the mechanism HOOK_WRAPPER's internal timeout uses
-    // to kill its whole tree (`kill -- -$$` targets this same group).
-    // Unix-only API; ekg only ships for macOS/Linux (see README/CI), so no
-    // other-platform fallback is needed. tokio::process::Command defines
-    // `process_group` natively (mirroring
-    // std::os::unix::process::CommandExt) rather than requiring that trait
-    // in scope.
+    // which doubles as the mechanism HOOK_WRAPPER's internal timeout (and
+    // completion-path cleanup) use to reach its whole tree (`kill -- -$$`
+    // targets this same group). Unix-only API; ekg only ships for
+    // macOS/Linux (see README/CI), so no other-platform fallback is
+    // needed. tokio::process::Command defines `process_group` natively
+    // (mirroring std::os::unix::process::CommandExt) rather than requiring
+    // that trait in scope.
     #[cfg(unix)]
     command.process_group(0);
 
     let Ok(mut child) = command.spawn() else {
         running.store(false, Ordering::SeqCst);
-        return;
+        return None;
     };
+    let wrapper_pid = child.id();
 
     // Reap the wrapper on a detached background task instead of a bare
     // `Child` drop — dropping without waiting leaves a zombie process until
@@ -271,21 +331,36 @@ fn spawn_hook_with_timeout(
         let _ = child.wait().await;
         running.store(false, Ordering::SeqCst);
     });
+
+    wrapper_pid
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Poll budget for every event-based wait below. Deliberately generous
+    /// (CI-scale, not laptop-scale): a shared/loaded CI runner can take
+    /// seconds just to schedule a `fork`+`exec` of `sh`, and these tests
+    /// previously used budgets in the 3-5s range that were comfortable
+    /// locally but flaked under real CI contention (observed on both
+    /// macOS and Ubuntu runners — see the commit that added this
+    /// constant). On a healthy machine every one of these tests still
+    /// finishes in a second or two, since `poll_until` returns as soon as
+    /// the condition is true; this budget only matters as an upper bound
+    /// for how long a slow environment gets before the test fails for a
+    /// real reason.
+    const TEST_POLL_BUDGET: Duration = Duration::from_secs(30);
+
     /// Polls `cond` until it's true or `budget` elapses, returning whether
-    /// it succeeded. Used instead of a single fixed `sleep` for the
-    /// process-spawning tests below: this whole suite runs with many tests
-    /// spawning shell subprocesses concurrently, and a fixed short sleep
-    /// (e.g. 100-600ms) that's comfortably long on a quiet machine can be
-    /// too short under that contention, making the test flaky rather than
-    /// wrong. Polling with a generous budget (seconds, not tens of
-    /// milliseconds) waits only as long as actually needed on a fast run
-    /// while still tolerating a slow/loaded one.
+    /// it succeeded. Used for every timing-sensitive assertion below in
+    /// place of "sleep a fixed amount, then assert" — this whole suite
+    /// spawns shell subprocesses, and a fixed sleep that's comfortably long
+    /// on a quiet machine can be too short under CI contention, making the
+    /// test flaky rather than wrong. Polling with a generous budget waits
+    /// only as long as actually needed on a fast run while still tolerating
+    /// a slow/loaded one; every assertion below is event-based ("did this
+    /// eventually happen") rather than "after N ms this should be true".
     async fn poll_until(budget: Duration, mut cond: impl FnMut() -> bool) -> bool {
         let start = tokio::time::Instant::now();
         loop {
@@ -317,11 +392,18 @@ mod tests {
     /// each test exercises internally (e.g. two `fire_outage` calls racing)
     /// is unaffected.
     ///
-    /// Uses `tokio::sync::Mutex` (not `std::sync::Mutex`) specifically
-    /// because its guard is held across `.await` points below — a
-    /// std-mutex guard held across an await is a clippy
-    /// `await_holding_lock` lint (and a real footgun on a multi-threaded
-    /// runtime), whereas an async mutex is designed for exactly this.
+    /// Uses `tokio::sync::Mutex` (not `std::sync::Mutex`) for two reasons:
+    /// its guard is held across `.await` points below, which a std-mutex
+    /// guard held across an await would trip clippy's `await_holding_lock`
+    /// lint on (and is a real footgun on a multi-threaded runtime); and —
+    /// relevant to test isolation specifically — `tokio::sync::Mutex` has
+    /// no poisoning concept at all, so a test that panics while holding
+    /// `_guard` (e.g. a failed `assert!`) simply drops and unlocks it
+    /// normally, letting the next test acquire it cleanly. A
+    /// `std::sync::Mutex` would instead poison on that panic and every
+    /// subsequent `.lock()` would need `unwrap_or_else(|e| e.into_inner())`
+    /// to avoid cascading every later test into a spurious poisoned-lock
+    /// panic unrelated to what it's actually testing.
     fn process_test_lock() -> &'static tokio::sync::Mutex<()> {
         static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -381,15 +463,45 @@ mod tests {
         assert_eq!(env.last().unwrap().1, "0");
     }
 
+    /// Confirms `HOOK_TIMEOUT` (production's actual value, 30s) formats to
+    /// a plain integer string with no decimal point or scientific
+    /// notation. This is what actually gets passed as the wrapper's `$3`
+    /// argv entry in production — pinned separately from (and faster/more
+    /// reliable than) any test that has to spawn a shell to indirectly
+    /// prove the same thing, since a wrong format here would make every
+    /// production hook fail the same way regardless of how the tests
+    /// happen to phrase their own timeouts.
+    #[test]
+    fn hook_timeout_formats_as_plain_integer_seconds() {
+        assert_eq!(HOOK_TIMEOUT.as_secs_f64().to_string(), "30");
+    }
+
+    // The tests below spawn real subprocesses and assert on process-level
+    // behavior (kill, wait, process groups) — `#[cfg(unix)]` since that
+    // behavior (and the `sh`/`kill` syntax these tests and HOOK_WRAPPER use)
+    // is POSIX-specific, matching ekg's own macOS/Linux-only support.
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn spawn_hook_does_not_panic_on_ordinary_command() {
         let _guard = process_test_lock().lock().await;
         let running = Arc::new(AtomicBool::new(true));
+        // Uses HOOK_TIMEOUT (production's real 30s value, not a
+        // test-shortened one) specifically so this test also stands as
+        // confirmation that the exact string production passes for `$3`
+        // (see hook_timeout_formats_as_plain_integer_seconds) is one the
+        // wrapper's `sleep "$3"` can actually parse and run with — a
+        // hypothetical shell/`sleep` that choked on it would just hang
+        // here until poll_until's budget expires and fails the test.
         spawn_hook_with_timeout("exit 0", &[], Arc::clone(&running), HOOK_TIMEOUT);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!running.load(Ordering::SeqCst));
+        let cleared = poll_until(TEST_POLL_BUDGET, || !running.load(Ordering::SeqCst)).await;
+        assert!(
+            cleared,
+            "an ordinary command never cleared the running flag"
+        );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn spawn_hook_survives_unresolvable_shell() {
         let _guard = process_test_lock().lock().await;
@@ -397,29 +509,36 @@ mod tests {
         let running = Arc::new(AtomicBool::new(true));
         spawn_hook_with_timeout("echo hi", &[], Arc::clone(&running), HOOK_TIMEOUT);
         std::env::remove_var("SHELL");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!running.load(Ordering::SeqCst));
+        let cleared = poll_until(TEST_POLL_BUDGET, || !running.load(Ordering::SeqCst)).await;
+        assert!(
+            cleared,
+            "an unresolvable $SHELL should still fail cleanly and clear the running flag"
+        );
     }
 
     /// Pins the actual kill-on-timeout behavior: a command that would
-    /// otherwise run for 5s is force-killed by a much shorter timeout, and
-    /// the single-flight flag is cleared well before the 5s would have
-    /// elapsed naturally — proof the kill (not just the natural exit)
-    /// cleared it.
+    /// otherwise run far longer than any reasonable test budget is
+    /// force-killed by a much shorter timeout, and the single-flight flag
+    /// is cleared as a result — proof the kill (not a natural exit) cleared
+    /// it. Both durations are whole seconds — no fractional `sleep`
+    /// argument anywhere in this test — specifically to rule out any
+    /// difference in how a given platform's `/bin/sh` (dash on Ubuntu,
+    /// bash-as-sh on macOS, ...) or its external `sleep` binary parses a
+    /// fractional-second argument; whole seconds are unambiguous
+    /// everywhere. See the module's test-hardening commit for the CI
+    /// flakiness this replaced.
+    #[cfg(unix)]
     #[tokio::test]
     async fn spawn_hook_kills_and_reaps_after_timeout() {
         let _guard = process_test_lock().lock().await;
         let running = Arc::new(AtomicBool::new(true));
         spawn_hook_with_timeout(
-            "sleep 5",
+            "sleep 300", // far longer than TEST_POLL_BUDGET could tolerate
             &[],
             Arc::clone(&running),
-            Duration::from_millis(50),
+            Duration::from_secs(1),
         );
-        // The kill fires at 50ms; poll well past that but far short of the
-        // uninterrupted 5s the command would otherwise take, so this test
-        // still fails loudly if the kill stops working.
-        let cleared = poll_until(Duration::from_secs(3), || !running.load(Ordering::SeqCst)).await;
+        let cleared = poll_until(TEST_POLL_BUDGET, || !running.load(Ordering::SeqCst)).await;
         assert!(cleared, "timeout kill never cleared the running flag");
     }
 
@@ -429,6 +548,7 @@ mod tests {
     /// synchronously (fine for a short-lived test-only check) rather than
     /// pulling in a `libc`/`nix` dependency just to call `kill(pid, 0)`
     /// directly.
+    #[cfg(unix)]
     fn pid_alive(pid: u32) -> bool {
         std::process::Command::new("kill")
             .arg("-0")
@@ -442,12 +562,18 @@ mod tests {
 
     /// Pins the fix for the group-kill bug: the timeout must kill the
     /// *entire* process group the wrapper leads, not just its immediate
-    /// child. `sleep 60 &` backgrounds a grandchild (relative to
+    /// child. `sleep 300 &` backgrounds a grandchild (relative to
     /// `spawn_hook_with_timeout`'s own child, the wrapper) that a naive
     /// "kill just the wrapper's pid" implementation would leave running
-    /// indefinitely past the timeout. The grandchild's own pid is recorded
-    /// to a file (via `$!`) so the test can check it directly, independent
-    /// of the wrapper process's fate.
+    /// indefinitely past the timeout — 300s is far longer than this test
+    /// (or its poll budgets) will ever wait, so the grandchild can only
+    /// disappear via the group kill, never a coincidental natural exit.
+    /// The grandchild's own pid is recorded to a file (via `$!`) so the
+    /// test can check it directly, independent of the wrapper process's
+    /// fate. `#[cfg(unix)]`: relies on POSIX process groups/signals and
+    /// `sh` job-control syntax, matching ekg's own macOS/Linux-only
+    /// support (see README/CI).
+    #[cfg(unix)]
     #[tokio::test]
     async fn spawn_hook_kills_whole_group_including_grandchildren() {
         let _guard = process_test_lock().lock().await;
@@ -459,10 +585,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let running = Arc::new(AtomicBool::new(true));
-        let cmd = format!("sleep 60 & echo $! > {}; wait", path.display());
-        spawn_hook_with_timeout(&cmd, &[], Arc::clone(&running), Duration::from_millis(100));
+        let cmd = format!("sleep 300 & echo $! > {}; wait", path.display());
+        spawn_hook_with_timeout(&cmd, &[], Arc::clone(&running), Duration::from_secs(1));
 
-        let recorded = poll_until(Duration::from_secs(3), || {
+        let recorded = poll_until(TEST_POLL_BUDGET, || {
             std::fs::read_to_string(&path)
                 .map(|s| !s.trim().is_empty())
                 .unwrap_or(false)
@@ -479,16 +605,168 @@ mod tests {
             "grandchild should still be alive right after it's recorded, before the timeout fires"
         );
 
-        // The 100ms timeout fires well before the grandchild's own 60s
-        // sleep would end naturally — if it's gone by the time this poll
-        // succeeds (comfortably within budget), that's the group kill, not
-        // a coincidental natural exit.
-        let dead = poll_until(Duration::from_secs(3), || !pid_alive(grandchild_pid)).await;
+        let dead = poll_until(TEST_POLL_BUDGET, || !pid_alive(grandchild_pid)).await;
         assert!(
             dead,
             "grandchild process (pid {grandchild_pid}) survived the timeout — group kill isn't reaching it"
         );
-        assert!(!running.load(Ordering::SeqCst));
+        let cleared = poll_until(TEST_POLL_BUDGET, || !running.load(Ordering::SeqCst)).await;
+        assert!(cleared, "wrapper's running flag was never cleared");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Lists the pids of every process currently in process group `pgid`,
+    /// via `ps -A -o pid=,pgid=` (all processes, no headers). `-A` (not
+    /// `-e`) specifically: `-e` means "all processes" on GNU `ps` but means
+    /// something unrelated (append the environment) on BSD/macOS `ps` —
+    /// `-A` is the one flag both agree on. Used by the completion-path
+    /// cleanup tests below to confirm a hook's group is fully empty, not
+    /// just that one specific pid is gone.
+    #[cfg(unix)]
+    fn process_group_members(pgid: u32) -> Vec<u32> {
+        let Ok(output) = std::process::Command::new("ps")
+            .arg("-A")
+            .arg("-o")
+            .arg("pid=,pgid=")
+            .output()
+        else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let pid: u32 = fields.next()?.parse().ok()?;
+                let pg: u32 = fields.next()?.parse().ok()?;
+                (pg == pgid).then_some(pid)
+            })
+            .collect()
+    }
+
+    /// Pins the completion-path half of the group-sweep fix: Codex's exact
+    /// repro was `cmd='sleep 60 &'` — the user command backgrounds a child
+    /// and returns without waiting on it, so the wrapper's own `wait "$u"`
+    /// returns almost immediately even though that grandchild is still
+    /// running. Before HOOK_WRAPPER grew its trailing
+    /// `trap '' TERM; kill -TERM -- -$$`, that grandchild would survive
+    /// the hook's own completion entirely and only die (if ever) when the
+    /// full timeout elapsed. A long (30s) timeout is used deliberately so
+    /// the *timeout* path can't be what's killing it here — if the
+    /// grandchild is dead well before that, it has to be the
+    /// completion-path sweep.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_hook_completion_kills_backgrounded_child_left_by_user_command() {
+        let _guard = process_test_lock().lock().await;
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("ekg-hook-stray-bg-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let running = Arc::new(AtomicBool::new(true));
+        let cmd = format!("sleep 60 & echo $! > {}", path.display());
+        spawn_hook_with_timeout(&cmd, &[], Arc::clone(&running), Duration::from_secs(30));
+
+        let recorded = poll_until(TEST_POLL_BUDGET, || {
+            std::fs::read_to_string(&path)
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+        })
+        .await;
+        assert!(recorded, "backgrounded child's pid was never recorded");
+        let bg_pid: u32 = std::fs::read_to_string(&path)
+            .unwrap()
+            .trim()
+            .parse()
+            .expect("recorded pid should be a plain integer");
+
+        let cleared = poll_until(TEST_POLL_BUDGET, || !running.load(Ordering::SeqCst)).await;
+        assert!(
+            cleared,
+            "the hook (which itself completes almost instantly) never cleared the running flag"
+        );
+
+        let dead = poll_until(TEST_POLL_BUDGET, || !pid_alive(bg_pid)).await;
+        assert!(
+            dead,
+            "backgrounded child (pid {bg_pid}) survived the hook's own completion — the \
+             completion-path group sweep isn't reaching it"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Pins the other half of the same fix: an *ordinary* quick hook (no
+    /// stray backgrounding by the user command at all) must still leave
+    /// zero processes behind in its own group — specifically including the
+    /// watchdog subshell's own `sleep "$3"`, which `kill "$w"` alone
+    /// doesn't reach (it kills the subshell, not the external `sleep`
+    /// process that subshell already forked). Checks the group as a whole
+    /// via `process_group_members` rather than guessing at individual
+    /// pids, so this would also catch any other kind of straggler this
+    /// wrapper might leave behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_hook_completion_sweeps_entire_group_no_stragglers() {
+        let _guard = process_test_lock().lock().await;
+        let running = Arc::new(AtomicBool::new(true));
+        let wrapper_pid =
+            spawn_hook_with_timeout("exit 0", &[], Arc::clone(&running), Duration::from_secs(30))
+                .expect("wrapper should have spawned");
+
+        let cleared = poll_until(TEST_POLL_BUDGET, || !running.load(Ordering::SeqCst)).await;
+        assert!(cleared, "an ordinary quick hook never completed");
+
+        let empty = poll_until(TEST_POLL_BUDGET, || {
+            process_group_members(wrapper_pid).is_empty()
+        })
+        .await;
+        assert!(
+            empty,
+            "hook's process group still has members after completion: {:?}",
+            process_group_members(wrapper_pid)
+        );
+    }
+
+    /// Pins the env-scrubbing fix: `EKG_OUTAGE_SECS` set in ekg's own
+    /// process environment (Codex's example: `EKG_OUTAGE_SECS=999 ekg
+    /// --on-outage ...`) must not leak into an `--on-outage` invocation,
+    /// which never sets it itself (see `outage_env`). Uses
+    /// `${EKG_OUTAGE_SECS+set}` — POSIX parameter expansion that's empty
+    /// only when the variable is genuinely *unset*, not merely empty —
+    /// so this distinguishes "scrubbed" from "present but blank", which a
+    /// plain `-z` check on the value couldn't.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_hook_scrubs_stale_reserved_env_vars_from_parent() {
+        let _guard = process_test_lock().lock().await;
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("ekg-hook-env-scrub-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        // Simulate a stray EKG_OUTAGE_SECS already present in ekg's own
+        // environment — unrelated to this specific outage invocation.
+        std::env::set_var("EKG_OUTAGE_SECS", "999");
+
+        let running = Arc::new(AtomicBool::new(true));
+        let cmd = format!(
+            r#"printf '%s' "${{EKG_OUTAGE_SECS+set}}" > {}"#,
+            path.display()
+        );
+        let env = outage_env("1.1.1.1", SystemTime::now());
+        spawn_hook_with_timeout(&cmd, &env, Arc::clone(&running), Duration::from_secs(30));
+
+        std::env::remove_var("EKG_OUTAGE_SECS");
+
+        let cleared = poll_until(TEST_POLL_BUDGET, || !running.load(Ordering::SeqCst)).await;
+        assert!(cleared, "hook never completed");
+
+        let contents = std::fs::read_to_string(&path).unwrap_or_default();
+        assert_eq!(
+            contents, "",
+            "EKG_OUTAGE_SECS leaked through from ekg's own environment into an \
+             --on-outage hook, which never sets it itself"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -496,6 +774,7 @@ mod tests {
     /// Behavioral test of `Hooks`' single-flight gate: firing the same kind
     /// twice back-to-back while the first is still running (a slow command)
     /// must result in only one execution, not two stacked ones.
+    #[cfg(unix)]
     #[tokio::test]
     async fn fire_outage_single_flight_skips_while_previous_still_running() {
         let _guard = process_test_lock().lock().await;
@@ -504,18 +783,34 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let hooks = Hooks::new();
-        // Deliberately slow relative to the poll budget below, so the
-        // second `fire_outage` call unambiguously lands while the first is
-        // still in flight rather than racing it.
-        let cmd = format!("sleep 0.5 && echo x >> {}", path.display());
+        // Whole-second sleep (not fractional) so this doesn't depend on how
+        // a given platform's shell/`sleep` parses a fractional argument —
+        // that's the actual *user command*, run by the resolved
+        // `$SHELL`/`sh`, not the wrapper's own `$3`, but there's no reason
+        // to depend on fractional support in either place when an integer
+        // second works just as well for creating the overlap window this
+        // test needs.
+        let cmd = format!("sleep 1 && echo x >> {}", path.display());
         hooks.fire_outage(&cmd, &[]);
         hooks.fire_outage(&cmd, &[]); // should be skipped: first still running
 
         // Wait for the (single) expected write to land...
-        assert!(poll_until(Duration::from_secs(5), || line_count(&path) >= 1).await);
-        // ...then confirm nothing further arrives after that.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(line_count(&path), 1);
+        assert!(
+            poll_until(TEST_POLL_BUDGET, || line_count(&path) >= 1).await,
+            "the one expected invocation never completed"
+        );
+        // ...then confirm a second write never arrives — poll for its
+        // *absence* holding across a real wait window instead of a single
+        // fixed sleep, so this is still event-based rather than "assume
+        // nothing more happens after N ms". A skipped second invocation
+        // never runs at all, so if none shows up by the time this budget
+        // expires, that's the expected (negative) outcome, not a race.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            line_count(&path),
+            1,
+            "a second invocation ran even though the first was still in flight"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -523,6 +818,7 @@ mod tests {
     /// A second event of the *same* kind after the first has finished must
     /// fire normally — single-flight only skips true overlap, it isn't a
     /// one-shot latch.
+    #[cfg(unix)]
     #[tokio::test]
     async fn fire_outage_fires_again_after_previous_completes() {
         let _guard = process_test_lock().lock().await;
@@ -534,12 +830,12 @@ mod tests {
         let cmd = format!("echo x >> {}", path.display());
         hooks.fire_outage(&cmd, &[]);
         assert!(
-            poll_until(Duration::from_secs(5), || line_count(&path) >= 1).await,
+            poll_until(TEST_POLL_BUDGET, || line_count(&path) >= 1).await,
             "first invocation never completed"
         );
         hooks.fire_outage(&cmd, &[]);
         assert!(
-            poll_until(Duration::from_secs(5), || line_count(&path) >= 2).await,
+            poll_until(TEST_POLL_BUDGET, || line_count(&path) >= 2).await,
             "second invocation, after the first completed, never fired"
         );
 
@@ -548,6 +844,7 @@ mod tests {
 
     /// `--on-outage` and `--on-recovery` are tracked independently: an
     /// in-flight outage hook must not block a recovery hook from firing.
+    #[cfg(unix)]
     #[tokio::test]
     async fn outage_and_recovery_single_flight_are_independent() {
         let _guard = process_test_lock().lock().await;
@@ -556,14 +853,14 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let hooks = Hooks::new();
-        let slow_cmd = format!("sleep 0.5 && echo outage >> {}", path.display());
+        let slow_cmd = format!("sleep 1 && echo outage >> {}", path.display());
         let fast_cmd = format!("echo recovery >> {}", path.display());
         hooks.fire_outage(&slow_cmd, &[]);
         hooks.fire_recovery(&fast_cmd, &[]);
 
         // The fast recovery hook should land well before the slow outage
-        // hook's 0.5s sleep elapses.
-        let recovered = poll_until(Duration::from_secs(3), || {
+        // hook's 1s sleep elapses.
+        let recovered = poll_until(TEST_POLL_BUDGET, || {
             std::fs::read_to_string(&path)
                 .unwrap_or_default()
                 .contains("recovery")
@@ -574,7 +871,7 @@ mod tests {
             .unwrap_or_default()
             .contains("outage"));
 
-        let outage_ran = poll_until(Duration::from_secs(5), || {
+        let outage_ran = poll_until(TEST_POLL_BUDGET, || {
             std::fs::read_to_string(&path)
                 .unwrap_or_default()
                 .contains("outage")
@@ -592,6 +889,7 @@ mod tests {
     /// `--on-outage` "in flight" for one target's `Hooks` must not skip a
     /// concurrent `--on-outage` fired on a *different* target's `Hooks`,
     /// the way it would if the flag were shared/global.
+    #[cfg(unix)]
     #[tokio::test]
     async fn separate_hooks_instances_do_not_share_single_flight_state() {
         let _guard = process_test_lock().lock().await;
@@ -603,7 +901,7 @@ mod tests {
         // worth of state (host A and host B).
         let host_a = Hooks::new();
         let host_b = Hooks::new();
-        let slow_cmd = format!("sleep 0.4 && echo a >> {}", path.display());
+        let slow_cmd = format!("sleep 1 && echo a >> {}", path.display());
         let fast_cmd = format!("echo b >> {}", path.display());
 
         host_a.fire_outage(&slow_cmd, &[]); // still "running" on host_a's Hooks
@@ -611,7 +909,7 @@ mod tests {
 
         // If single-flight state were (incorrectly) shared, host_b's fire
         // would have been dropped and "b" would never show up.
-        let host_b_ran = poll_until(Duration::from_secs(3), || {
+        let host_b_ran = poll_until(TEST_POLL_BUDGET, || {
             std::fs::read_to_string(&path)
                 .unwrap_or_default()
                 .contains('b')
@@ -622,7 +920,7 @@ mod tests {
             "host_b's hook never ran — single-flight state leaked across targets"
         );
 
-        let host_a_ran = poll_until(Duration::from_secs(5), || {
+        let host_a_ran = poll_until(TEST_POLL_BUDGET, || {
             std::fs::read_to_string(&path)
                 .unwrap_or_default()
                 .contains('a')

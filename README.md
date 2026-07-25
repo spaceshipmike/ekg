@@ -92,6 +92,10 @@ Two safety bounds, so a flapping link can't pile up unbounded background work:
   `--on-outage` and `--on-recovery` are likewise tracked independently, so one kind being in flight never
   blocks the other.
 
+Cleanup isn't only a timeout thing: when the command finishes normally (before 30s), ekg still sweeps its
+entire process group on the way out — so a command that backgrounds its own child and doesn't wait on it
+(`sleep 60 &`) doesn't leave that child running past the hook's own completion.
+
 Env vars passed to the command:
 
 | Var | When | Meaning |
@@ -99,6 +103,9 @@ Env vars passed to the command:
 | `EKG_HOST` | both | the target host/IP that changed state |
 | `EKG_OUTAGE_START` | both | outage start time, ms since the Unix epoch (same format as `--log`'s `ts`) |
 | `EKG_OUTAGE_SECS` | recovery only | whole seconds the outage lasted |
+
+Only these vars are ever set, and any of the same names already present in ekg's own environment are cleared
+first — an `--on-outage` hook never sees a stale `EKG_OUTAGE_SECS` left over from somewhere else, for example.
 
 ## Install
 
