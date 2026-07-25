@@ -73,6 +73,18 @@ fn fmt_duration_short(d: Duration) -> String {
     }
 }
 
+/// Returns the first candidate string that fits `width` columns, falling back
+/// to the last (tersest) candidate when none fit. Used for progressive
+/// shortening of panel lines in narrow panes.
+fn first_fit(width: usize, candidates: &[String]) -> String {
+    candidates
+        .iter()
+        .find(|c| c.chars().count() <= width)
+        .or_else(|| candidates.last())
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// Renders the status panel in place and manages outage-line emission.
 pub struct Display {
     last_height: u16,
@@ -168,6 +180,7 @@ impl Display {
         self.clear_panel()?;
         let mut out = stdout();
 
+        let width = terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
         let is_down = down_since.is_some();
         let avg = stats.avg_rtt();
         let avg_ms = avg.map(|d| d.as_secs_f64() * 1000.0);
@@ -179,11 +192,16 @@ impl Display {
         // character within the sparkline is colored red regardless of
         // overall quality (a visible drop even in an otherwise-green window).
         if let Some(down_for) = down_since {
+            let d = fmt_duration_short(down_for);
+            let line = first_fit(
+                width,
+                &[
+                    format!("✗ {host}   no reply for {d}"),
+                    format!("✗ no reply {d}"),
+                ],
+            );
             out.queue(SetForegroundColor(color))?;
-            out.queue(Print(format!(
-                "✗ {host}   no reply for {}\n",
-                fmt_duration_short(down_for)
-            )))?;
+            out.queue(Print(format!("{line}\n")))?;
             out.queue(ResetColor)?;
         } else {
             let last_ms = avg.map(fmt_ms).unwrap_or_else(|| "--".to_string());
@@ -191,7 +209,6 @@ impl Display {
             // Shrink the sparkline to the columns actually available so the
             // panel stays useful (not clipped) in narrow panes. Wrap is
             // disabled, so an over-long line would clip, never corrupt.
-            let width = terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
             let prefix = format!(" {host}   {last_ms}   ");
             let available = width.saturating_sub(prefix.chars().count() + 2);
             let effective_spark = spark_count.min(available);
@@ -216,7 +233,8 @@ impl Display {
             out.queue(Print("\n"))?;
         }
 
-        // Line 2
+        // Line 2 — progressively shortened in narrow panes: jitter goes
+        // first, then labels; avg / loss / uptime survive the longest.
         let avg_str = avg.map(fmt_ms).unwrap_or_else(|| "--".to_string());
         let jitter_str = stats
             .jitter()
@@ -225,15 +243,31 @@ impl Display {
         let uptime_str = uptime_since_recovery
             .map(fmt_duration_short)
             .unwrap_or_else(|| "--".to_string());
-        out.queue(Print(format!(
-            "  avg {avg_str} · jitter {jitter_str} · loss {loss:.0}% · up {uptime_str}\n"
-        )))?;
+        let line2 = first_fit(
+            width,
+            &[
+                format!(
+                    "  avg {avg_str} · jitter {jitter_str} · loss {loss:.0}% · up {uptime_str}"
+                ),
+                format!("  avg {avg_str} · loss {loss:.0}% · up {uptime_str}"),
+                format!("  {avg_str} · {loss:.0}% · up {uptime_str}"),
+                format!("  {avg_str} {loss:.0}% {uptime_str}"),
+            ],
+        );
+        out.queue(Print(format!("{line2}\n")))?;
 
         let mut height = 2;
 
-        // Line 3 (only after an outage has occurred)
+        // Line 3 (only after an outage has occurred), shortened when narrow.
         if let Some(summary) = last_outage_summary {
-            out.queue(Print(format!("  {summary}\n")))?;
+            let line3 = first_fit(
+                width,
+                &[
+                    format!("  {summary}"),
+                    format!("  {}", summary.replacen("last outage: ", "outage ", 1)),
+                ],
+            );
+            out.queue(Print(format!("{line3}\n")))?;
             height = 3;
         }
 
@@ -311,4 +345,43 @@ mod local_time {
 /// `main.rs` (the final Ctrl-C summary), so there is one source of truth.
 pub fn local_hms(t: std::time::SystemTime) -> String {
     local_time::local_hms(t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::first_fit;
+
+    fn cands() -> Vec<String> {
+        vec![
+            "  avg 14ms · jitter 2ms · loss 0% · up 2h14m".into(),
+            "  avg 14ms · loss 0% · up 2h14m".into(),
+            "  14ms · 0% · up 2h14m".into(),
+            "  14ms 0% 2h14m".into(),
+        ]
+    }
+
+    #[test]
+    fn wide_pane_gets_full_line() {
+        assert_eq!(first_fit(80, &cands()), cands()[0]);
+    }
+
+    #[test]
+    fn medium_pane_drops_jitter() {
+        assert_eq!(first_fit(35, &cands()), cands()[1]);
+    }
+
+    #[test]
+    fn narrow_pane_drops_labels() {
+        assert_eq!(first_fit(23, &cands()), cands()[2]);
+    }
+
+    #[test]
+    fn tiny_pane_falls_back_to_tersest_even_if_it_clips() {
+        assert_eq!(first_fit(5, &cands()), cands()[3]);
+    }
+
+    #[test]
+    fn empty_candidates_yield_empty_string() {
+        assert_eq!(first_fit(10, &[]), "");
+    }
 }
