@@ -50,8 +50,11 @@ struct Args {
 
     /// With --count, the maximum lifetime loss percentage still considered
     /// a success (exit code 0). Default 0: any packet loss at all is a
-    /// failing run. Ignored without --count.
-    #[arg(long, default_value_t = 0.0)]
+    /// failing run. Ignored without --count. Must be a finite value in
+    /// 0.0..=100.0 — anything outside that range (including inf/NaN) would
+    /// make a --count health check silently exit 0 no matter how bad the
+    /// loss was, so clap rejects it up front.
+    #[arg(long, default_value_t = 0.0, value_parser = parse_max_loss)]
     max_loss: f64,
 
     /// Append each ping sample, plus outage start/end events, to this file
@@ -330,6 +333,27 @@ fn loss_within_threshold(loss_pct: f64, max_loss_pct: f64) -> bool {
     loss_pct <= max_loss_pct
 }
 
+/// clap `value_parser` for `--max-loss`. A loss percentage is only
+/// meaningful in 0.0..=100.0, and it must be finite: `inf` trivially passes
+/// `loss_pct <= max_loss_pct` for any loss, and `NaN` fails every
+/// comparison (`<=` is always false for NaN), including the ones a caller
+/// would expect to be obviously fine (e.g. 0% loss). Either would make
+/// `--count`'s exit code silently lie about a failing run, so this rejects
+/// both up front with a clear error instead of letting them reach
+/// `loss_within_threshold`.
+fn parse_max_loss(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|_| format!("'{s}' is not a number"))?;
+    if !v.is_finite() {
+        return Err(format!("--max-loss must be a finite number, got '{s}'"));
+    }
+    if !(0.0..=100.0).contains(&v) {
+        return Err(format!(
+            "--max-loss must be between 0 and 100 (a percentage), got '{s}'"
+        ));
+    }
+    Ok(v)
+}
+
 /// Applies one tagged ping event to its target's state: outage/recovery
 /// bookkeeping (including any permanent outage/notice line emission) and
 /// the rolling `Stats` record. Split out from the render step so a burst of
@@ -529,5 +553,34 @@ mod tests {
     fn loss_within_threshold_full_loss_and_full_allowance() {
         assert!(loss_within_threshold(100.0, 100.0));
         assert!(!loss_within_threshold(100.0, 99.9));
+    }
+
+    #[test]
+    fn parse_max_loss_rejects_out_of_range() {
+        assert!(parse_max_loss("101").is_err());
+        assert!(parse_max_loss("-1").is_err());
+        assert!(parse_max_loss("1000").is_err());
+    }
+
+    #[test]
+    fn parse_max_loss_rejects_non_finite() {
+        assert!(parse_max_loss("inf").is_err());
+        assert!(parse_max_loss("infinity").is_err());
+        assert!(parse_max_loss("-inf").is_err());
+        assert!(parse_max_loss("NaN").is_err());
+    }
+
+    #[test]
+    fn parse_max_loss_rejects_garbage() {
+        assert!(parse_max_loss("not-a-number").is_err());
+        assert!(parse_max_loss("").is_err());
+    }
+
+    #[test]
+    fn parse_max_loss_accepts_boundary_and_mid_values() {
+        assert_eq!(parse_max_loss("0"), Ok(0.0));
+        assert_eq!(parse_max_loss("50"), Ok(50.0));
+        assert_eq!(parse_max_loss("100"), Ok(100.0));
+        assert_eq!(parse_max_loss("20.5"), Ok(20.5));
     }
 }

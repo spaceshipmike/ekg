@@ -427,6 +427,28 @@ impl Default for Display {
     }
 }
 
+impl Drop for Display {
+    /// RAII terminal restoration: any exit path that lets `Display` go out
+    /// of scope via a normal Rust return — in particular an `?`-propagated
+    /// I/O error mid-render or mid-recorder-write (e.g. `--log` hitting a
+    /// disk-full or unplugged volume) — must still leave the cursor visible
+    /// and line wrap re-enabled, not just the paths that happen to call
+    /// `restore_cursor()` explicitly before returning. `restore_cursor` is
+    /// idempotent (gated on `hidden_cursor`), so this is safe to run after
+    /// an explicit call already ran (the Ctrl-C, --count, and dead-pinger
+    /// exit paths all still call it explicitly, for the human-facing
+    /// ordering reasons noted at each call site) — the second call here
+    /// just no-ops.
+    ///
+    /// This does NOT cover `std::process::exit` — that bypasses `Drop`
+    /// entirely, which is exactly why those paths (dead-pinger detection,
+    /// `--count`'s summary-and-exit) still restore explicitly before
+    /// calling it.
+    fn drop(&mut self) {
+        self.restore_cursor();
+    }
+}
+
 // Local wall-clock formatting (HH:MM:SS), avoiding an extra crate dependency
 // (e.g. chrono) just for this. On Unix (macOS + Linux) this uses the platform
 // libc's `localtime_r` via a minimal FFI binding — the C `tm`/`time_t` layout
