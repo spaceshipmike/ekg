@@ -70,12 +70,27 @@ pub fn create_client(target: IpAddr) -> Result<Client, String> {
     })
 }
 
+/// True once `sent` has reached `count`'s bound — i.e. this target's ping
+/// loop should stop issuing new pings. `None` means unbounded (the normal
+/// Ctrl-C-driven run) and never triggers. Pulled out as a pure function so
+/// `--count`'s bounding logic is unit-testable without a live socket/tokio
+/// runtime.
+fn count_reached(sent: u64, count: Option<u64>) -> bool {
+    matches!(count, Some(max) if sent >= max)
+}
+
 /// Spawns the ping loop for one target on the current tokio runtime, plus a
 /// small supervisor task that watches it. Events are tagged with `idx` (the
 /// target's position in the CLI's target list) and sent over the shared
 /// `tx`, so any number of targets can multiplex their independent ping
 /// loops (each with its own client/socket) onto one channel that `main`
 /// selects over.
+///
+/// `count` bounds how many pings this target sends (mirrors `--count`,
+/// `None` = unbounded). This must live here, per-target, rather than being
+/// filtered after the fact in `main` — targets tick independently, so
+/// without a bound a fast target keeps accumulating samples (diluting its
+/// loss %) while a slow target is still working toward the same N.
 ///
 /// The ping loop's only normal exit path is `tx.send(..).await` failing,
 /// which only happens once `main`'s receiver has been dropped — i.e. after
@@ -89,12 +104,16 @@ pub fn create_client(target: IpAddr) -> Result<Client, String> {
 /// `JoinHandle` (which resolves on either a normal return or a caught
 /// panic) and reports `idx` on `death_tx` so `main` can detect it, restore
 /// the terminal, and exit instead of silently rendering a stale row
-/// forever.
+/// forever. Because of that, once this target has sent its `count` worth of
+/// pings it must NOT return — it idles forever instead, so it never looks
+/// like a crash. `main` tears the whole process down (killing this task
+/// too) once every target has reached its bound.
 pub fn spawn(
     client: Client,
     host: IpAddr,
     interval: Duration,
     idx: usize,
+    count: Option<u64>,
     tx: mpsc::Sender<TaggedEvent>,
     death_tx: mpsc::Sender<usize>,
 ) {
@@ -109,14 +128,19 @@ pub fn spawn(
 
         let payload = [0u8; 56];
         let mut seq: u16 = 0;
+        let mut sent: u64 = 0;
 
         loop {
+            if count_reached(sent, count) {
+                std::future::pending::<()>().await;
+            }
             ticker.tick().await;
             let event = match pinger.ping(PingSequence(seq), &payload).await {
                 Ok((_packet, rtt)) => PingEvent::Reply(rtt),
                 Err(_) => PingEvent::Timeout,
             };
             seq = seq.wrapping_add(1);
+            sent += 1;
             if tx.send(TaggedEvent { idx, event }).await.is_err() {
                 break;
             }
@@ -136,6 +160,27 @@ pub fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn count_reached_none_is_unbounded() {
+        assert!(!count_reached(0, None));
+        assert!(!count_reached(1_000_000, None));
+    }
+
+    #[test]
+    fn count_reached_bounds_at_exact_count() {
+        assert!(!count_reached(2, Some(3)));
+        assert!(count_reached(3, Some(3)));
+        assert!(count_reached(4, Some(3)));
+    }
+
+    #[test]
+    fn count_reached_zero_bound_is_immediate() {
+        // --count 0 is short-circuited in main before any pinger is
+        // spawned, but the predicate itself should still be correct for
+        // it: sent=0 already meets a bound of 0.
+        assert!(count_reached(0, Some(0)));
+    }
 
     /// Pins the detection wiring itself: constructing a real dead pinger
     /// (e.g. a target address that fails mid-run) isn't practical to do
