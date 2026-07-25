@@ -26,6 +26,12 @@ struct Args {
     /// Rolling window size (number of samples kept for stats/sparkline).
     #[arg(short, long, default_value_t = 60)]
     window: usize,
+
+    /// Stop printing permanent outage lines after this many (0 disables them
+    /// entirely). The panel's "last outage" line and the final summary still
+    /// reflect every outage.
+    #[arg(short, long)]
+    max_outages: Option<u32>,
 }
 
 /// Resolves the host argument to an IP address, accepting either a literal
@@ -85,6 +91,7 @@ async fn main() -> std::io::Result<()> {
     let mut last_recovery: Instant = session_start;
     let mut outage_count: u32 = 0;
     let mut last_outage_summary: Option<String> = None;
+    let mut cap_notice_printed = false;
 
     let spark_count = 20usize;
 
@@ -114,7 +121,17 @@ async fn main() -> std::io::Result<()> {
                                 let duration = down_since
                                     .map(|t| t.elapsed())
                                     .unwrap_or_default();
-                                display.emit_outage_line(started_wall, duration)?;
+                                match args.max_outages {
+                                    Some(cap) if outage_count >= cap => {
+                                        if outage_count == cap && cap > 0 && !cap_notice_printed {
+                                            display.emit_notice_line(&format!(
+                                                "… outage log capped at {cap}; later outages still counted in the summary"
+                                            ))?;
+                                            cap_notice_printed = true;
+                                        }
+                                    }
+                                    _ => display.emit_outage_line(started_wall, duration)?,
+                                }
                                 last_outage_summary = Some(format!(
                                     "last outage: {} ({})",
                                     display::local_hms(started_wall),

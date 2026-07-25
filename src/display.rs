@@ -134,6 +134,18 @@ impl Display {
         Ok(())
     }
 
+    /// Prints a permanent dimmed notice line (e.g. "outage log capped") that
+    /// scrolls into history like an outage line.
+    pub fn emit_notice_line(&mut self, text: &str) -> std::io::Result<()> {
+        self.clear_panel()?;
+        let mut out = stdout();
+        out.queue(SetForegroundColor(Color::DarkGrey))?;
+        out.queue(Print(format!("{text}\n")))?;
+        out.queue(ResetColor)?;
+        out.flush()?;
+        Ok(())
+    }
+
     /// Renders the (up to) 3-line panel in place.
     #[allow(clippy::too_many_arguments)]
     pub fn render(
