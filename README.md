@@ -22,6 +22,7 @@ ekg pings a host and renders a small status panel that updates **in place** — 
 - **Quality color** — green / yellow / red by latency and loss
 - **Outage log** — one permanent line per connection drop, with start time and duration; cap or disable with `-m`
 - **Recorder** — `--log file.jsonl` appends every sample and outage event as JSON, for scripting or offline analysis
+- **Outage hooks** — `--on-outage` / `--on-recovery` run a shell command when the connection drops/comes back, for push notifications or automations
 - **Scripted runs** — `-c N` sends N pings and exits with a loss-based status code, no interactive session needed
 - **No sudo** — uses unprivileged ICMP datagram sockets
 - **Fast and tiny** — single static binary, four dependencies
@@ -37,6 +38,8 @@ ekg -m 5                # stop logging outage lines after 5 (0 = never log)
 ekg --log ping.jsonl    # append each sample + outage event as JSONL
 ekg -c 100              # send 100 pings, print summary, exit (0 = no loss)
 ekg -c 100 --max-loss 5 # same, but allow up to 5% loss and still exit 0
+ekg --on-outage 'ntfy publish home-net "down: $EKG_HOST"' \
+    --on-recovery 'ntfy publish home-net "up: $EKG_HOST after ${EKG_OUTAGE_SECS}s"'
 ```
 
 Ctrl-C prints a session summary: duration, sent/received, loss, min/avg/max, outage count. `-c`/`--count` prints
@@ -56,6 +59,56 @@ One JSON object per line, appended (not truncated) so an overnight run's data su
 
 `ts` is milliseconds since the Unix epoch. Sample lines have no `event` field; outage lines have no `rtt_ms`
 field — check for the field's presence, not a fixed schema, when parsing.
+
+### `--on-outage` / `--on-recovery` hooks
+
+Run an arbitrary command when an outage is declared and when it recovers — for push notifications, external
+logging, or automations (e.g. power-cycling a router):
+
+```bash
+ekg --on-outage 'ntfy publish home-net "ekg: $EKG_HOST is down"' \
+    --on-recovery 'ntfy publish home-net "ekg: $EKG_HOST recovered after ${EKG_OUTAGE_SECS}s"'
+```
+
+Each command runs via `$SHELL -c` (falling back to `sh -c` if `$SHELL` is unset) — the same shell you'd get
+in an interactive terminal, so pipes, quoting, and env var expansion all work as expected. It's spawned
+**detached, in its own process group**: stdin/stdout/stderr are discarded, the ping loop never waits on it, and
+it doesn't die alongside ekg on Ctrl-C or a terminal hangup — a slow or hung command (a flaky notification API,
+a router that takes a while to reboot) can't stall monitoring or corrupt the panel, and a power-cycle command
+gets to actually finish even if you Ctrl-C out of ekg right after triggering it.
+
+Two safety bounds, so a flapping link can't pile up unbounded background work:
+
+- **30s timeout, enforced on the whole process tree, independent of ekg** — the command isn't run directly;
+  it's run inside a small watchdog wrapper that backgrounds it, waits, and — if 30 seconds pass first — sends
+  `SIGKILL` to the entire process group. Because the wrapper, the command, and anything the command itself
+  spawns (a pipeline, a child process) all share that one process group, the kill takes down the whole tree,
+  not just the immediate process. And because the watchdog lives inside the hook's own process tree rather
+  than as a task inside ekg, the timeout still fires even if ekg has already exited (Ctrl-C, or right after
+  the last `--count` ping) — a hung hook can't outlive ekg and run forever.
+- **Single-flight per target and per hook kind** — if the previous `--on-outage` for a given host is still
+  running when that host's next outage is declared, the new invocation is skipped rather than stacked; a
+  different host's `--on-outage` is entirely unaffected, since each target's single-flight state is separate.
+  `--on-outage` and `--on-recovery` are likewise tracked independently, so one kind being in flight never
+  blocks the other.
+
+Cleanup isn't only a timeout thing: when the command finishes normally (before 30s), ekg still sweeps its
+entire process group on the way out — so a command that backgrounds its own child and doesn't wait on it
+(`sleep 60 &`) doesn't leave that child running past the hook's own completion. That sweep is two-stage: a
+`SIGTERM` first (a straggler that traps it for its own cleanup gets a real chance to use it), then, after a
+1-second grace period, an unconditional `SIGKILL` for anything still around — including a straggler that
+ignores `SIGTERM` entirely. Either way, nothing from a completed hook outlives it by more than a second.
+
+Env vars passed to the command:
+
+| Var | When | Meaning |
+| --- | --- | --- |
+| `EKG_HOST` | both | the target host/IP that changed state |
+| `EKG_OUTAGE_START` | both | outage start time, ms since the Unix epoch (same format as `--log`'s `ts`) |
+| `EKG_OUTAGE_SECS` | recovery only | whole seconds the outage lasted |
+
+Only these vars are ever set, and any of the same names already present in ekg's own environment are cleared
+first — an `--on-outage` hook never sees a stale `EKG_OUTAGE_SECS` left over from somewhere else, for example.
 
 ## Install
 
