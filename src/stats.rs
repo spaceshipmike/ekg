@@ -121,46 +121,40 @@ impl Stats {
     }
 
     /// Sparkline bucket levels (0..=7) for the last `count` samples, scaled
-    /// to the min/max RTT within that slice. `None` entries represent
-    /// timeouts (rendered as a gap character by the display layer).
+    /// to fixed absolute RTT thresholds (see [`SPARK_BUCKET_MS`]) rather than
+    /// the window's own min/max. This makes bar height mean something
+    /// consistent — the same RTT always maps to the same bar — so a single
+    /// outlier can't flatten the rest of the window, and post-outage bars
+    /// appear at their true level immediately instead of waiting for the
+    /// outlier to age out. `None` entries represent timeouts (rendered as a
+    /// gap character by the display layer).
     pub fn sparkline_buckets(&self, count: usize) -> Vec<Option<u8>> {
         let start = self.samples.len().saturating_sub(count);
         let recent: Vec<&Sample> = self.samples.iter().skip(start).collect();
-
-        let rtts: Vec<f64> = recent
-            .iter()
-            .filter_map(|s| match s {
-                Sample::Reply(d) => Some(d.as_secs_f64()),
-                Sample::Timeout => None,
-            })
-            .collect();
-
-        if rtts.is_empty() {
-            return recent.iter().map(|_| None).collect();
-        }
-
-        let min = rtts.iter().cloned().fold(f64::INFINITY, f64::min);
-        let max = rtts.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let range = max - min;
 
         recent
             .iter()
             .map(|s| match s {
                 Sample::Timeout => None,
-                Sample::Reply(d) => {
-                    let v = d.as_secs_f64();
-                    let level = if range <= f64::EPSILON {
-                        // Single-value or flat window: mid-level bar.
-                        4u8
-                    } else {
-                        let normalized = (v - min) / range;
-                        (normalized * 7.0).round().clamp(0.0, 7.0) as u8
-                    };
-                    Some(level)
-                }
+                Sample::Reply(d) => Some(spark_bucket_level(d.as_secs_f64() * 1000.0)),
             })
             .collect()
     }
+}
+
+/// Upper bound (in milliseconds, exclusive) of each sparkline bucket level,
+/// indexed 0..=6; level 7 is everything at or above the last threshold. The
+/// single source of truth for the fixed, log-spaced RTT bands used by
+/// [`Stats::sparkline_buckets`] — bar height is absolute badness, not
+/// relative to whatever happens to be in the current window.
+const SPARK_BUCKET_MS: [f64; 7] = [15.0, 30.0, 60.0, 100.0, 200.0, 400.0, 800.0];
+
+/// Map an RTT (in milliseconds) to its fixed sparkline bucket level (0..=7).
+fn spark_bucket_level(rtt_ms: f64) -> u8 {
+    SPARK_BUCKET_MS
+        .iter()
+        .position(|&threshold| rtt_ms < threshold)
+        .map_or(7u8, |i| i as u8)
 }
 
 #[cfg(test)]
@@ -258,20 +252,25 @@ mod tests {
     }
 
     #[test]
-    fn sparkline_single_sample_mid_level() {
+    fn sparkline_single_sample_absolute_level() {
+        // 15ms is exactly the level-0/1 boundary (< 15 is level 0), so 15ms
+        // itself lands in level 1, not a window-relative "mid" bucket.
         let mut s = Stats::new(5);
         s.record(Sample::Reply(ms(15)));
         let buckets = s.sparkline_buckets(5);
-        assert_eq!(buckets, vec![Some(4)]);
+        assert_eq!(buckets, vec![Some(1)]);
     }
 
     #[test]
-    fn sparkline_scales_to_min_max() {
+    fn sparkline_uses_absolute_thresholds_not_window_min_max() {
+        // Previously this pair would have scaled to Some(0), Some(7) purely
+        // because they're the window's min/max. Under absolute scaling, 0ms
+        // is level 0 and 100ms lands in its own absolute band (< 200 -> 4).
         let mut s = Stats::new(5);
         s.record(Sample::Reply(ms(0)));
         s.record(Sample::Reply(ms(100)));
         let buckets = s.sparkline_buckets(5);
-        assert_eq!(buckets, vec![Some(0), Some(7)]);
+        assert_eq!(buckets, vec![Some(0), Some(4)]);
     }
 
     #[test]
@@ -282,6 +281,56 @@ mod tests {
         }
         let buckets = s.sparkline_buckets(3);
         assert_eq!(buckets.len(), 3);
+    }
+
+    #[test]
+    fn sparkline_steady_low_latency_window_stays_low() {
+        // A steady, healthy window (12-18ms) should render entirely in the
+        // bottom two bands (0 or 1), never inflated by relative scaling.
+        let mut s = Stats::new(10);
+        for ms_val in [12, 14, 15, 16, 18, 13, 17, 14] {
+            s.record(Sample::Reply(ms(ms_val)));
+        }
+        let buckets = s.sparkline_buckets(10);
+        assert!(buckets.iter().all(|b| matches!(b, Some(0) | Some(1))));
+    }
+
+    #[test]
+    fn sparkline_high_rtt_window_hits_level_six() {
+        // 731ms falls in the < 800ms band -> level 6, distinct from the
+        // ">= 800ms" level 7 band.
+        let mut s = Stats::new(5);
+        s.record(Sample::Reply(ms(731)));
+        let buckets = s.sparkline_buckets(5);
+        assert_eq!(buckets, vec![Some(6)]);
+    }
+
+    #[test]
+    fn sparkline_at_or_above_800ms_is_level_seven() {
+        let mut s = Stats::new(5);
+        s.record(Sample::Reply(ms(800)));
+        s.record(Sample::Reply(ms(2500)));
+        let buckets = s.sparkline_buckets(5);
+        assert_eq!(buckets, vec![Some(7), Some(7)]);
+    }
+
+    #[test]
+    fn sparkline_recovery_window_straggler_does_not_flatten_steady_bars() {
+        // A single 900ms straggler mixed into an otherwise steady, healthy
+        // 15ms window must NOT drag the steady samples up (or flatten them
+        // to a full-height bar's worth of "badness") the way relative
+        // min/max scaling used to. The straggler alone is level 7; the
+        // steady samples stay at level 0.
+        let mut s = Stats::new(10);
+        s.record(Sample::Reply(ms(900)));
+        for _ in 0..5 {
+            s.record(Sample::Reply(ms(14)));
+        }
+        let buckets = s.sparkline_buckets(10);
+        assert_eq!(buckets[0], Some(7));
+        for level in &buckets[1..] {
+            assert_eq!(*level, Some(0));
+        }
     }
 
     #[test]
@@ -323,5 +372,15 @@ mod tests {
         s.record(Sample::Reply(ms(200)));
         assert_eq!(s.min_rtt.unwrap(), ms(5));
         assert_eq!(s.max_rtt.unwrap(), ms(200));
+    }
+
+    #[test]
+    fn spark_bucket_boundaries_table() {
+        // Every threshold: just-below stays in the lower level, exact value
+        // lands in the next level (consistent `<` comparison direction).
+        for (i, &t) in SPARK_BUCKET_MS.iter().enumerate() {
+            assert_eq!(spark_bucket_level(t - 0.001), i as u8, "below {t}ms");
+            assert_eq!(spark_bucket_level(t), i as u8 + 1, "exact {t}ms");
+        }
     }
 }
