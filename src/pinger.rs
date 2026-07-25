@@ -27,6 +27,14 @@ pub enum PingEvent {
     Timeout,
 }
 
+/// A `PingEvent` tagged with the index of the target it came from, so
+/// multiple per-target ping loops can multiplex onto one shared channel.
+#[derive(Debug, Clone, Copy)]
+pub struct TaggedEvent {
+    pub idx: usize,
+    pub event: PingEvent,
+}
+
 impl From<PingEvent> for Sample {
     fn from(e: PingEvent) -> Self {
         match e {
@@ -62,12 +70,35 @@ pub fn create_client(target: IpAddr) -> Result<Client, String> {
     })
 }
 
-/// Spawns the ping loop on the current tokio runtime and returns a receiver
-/// that yields one `PingEvent` per interval tick until the task ends.
-pub fn spawn(client: Client, host: IpAddr, interval: Duration) -> mpsc::Receiver<PingEvent> {
-    let (tx, rx) = mpsc::channel(8);
-
-    tokio::spawn(async move {
+/// Spawns the ping loop for one target on the current tokio runtime, plus a
+/// small supervisor task that watches it. Events are tagged with `idx` (the
+/// target's position in the CLI's target list) and sent over the shared
+/// `tx`, so any number of targets can multiplex their independent ping
+/// loops (each with its own client/socket) onto one channel that `main`
+/// selects over.
+///
+/// The ping loop's only normal exit path is `tx.send(..).await` failing,
+/// which only happens once `main`'s receiver has been dropped — i.e. after
+/// `main`'s event loop has already ended. So while `main` is still running,
+/// this task ending (whether it returns normally or panics) always means
+/// something went wrong for this target, and a dead-but-undetected pinger
+/// would otherwise leave that target frozen at its last rendered state
+/// forever (the shared `mpsc::Receiver` only closes once *every* sender —
+/// i.e. every target's task — has dropped its clone, so one dead target
+/// does not end the others). The supervisor awaits the ping loop's
+/// `JoinHandle` (which resolves on either a normal return or a caught
+/// panic) and reports `idx` on `death_tx` so `main` can detect it, restore
+/// the terminal, and exit instead of silently rendering a stale row
+/// forever.
+pub fn spawn(
+    client: Client,
+    host: IpAddr,
+    interval: Duration,
+    idx: usize,
+    tx: mpsc::Sender<TaggedEvent>,
+    death_tx: mpsc::Sender<usize>,
+) {
+    let handle = tokio::spawn(async move {
         let mut pinger = client
             .pinger(host, PingIdentifier(std::process::id() as u16))
             .await;
@@ -86,11 +117,61 @@ pub fn spawn(client: Client, host: IpAddr, interval: Duration) -> mpsc::Receiver
                 Err(_) => PingEvent::Timeout,
             };
             seq = seq.wrapping_add(1);
-            if tx.send(event).await.is_err() {
+            if tx.send(TaggedEvent { idx, event }).await.is_err() {
                 break;
             }
         }
     });
 
-    rx
+    tokio::spawn(async move {
+        // `Err` here means the ping loop panicked (tokio catches the
+        // unwind and reports it via `JoinError`); `Ok(())` means it
+        // returned normally. Either way, while `main` is still alive that
+        // is unexpected — see the doc comment above.
+        let _ = handle.await;
+        let _ = death_tx.send(idx).await;
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the detection wiring itself: constructing a real dead pinger
+    /// (e.g. a target address that fails mid-run) isn't practical to do
+    /// cheaply in a test, but the supervisor pattern `spawn` uses — await
+    /// the ping loop's `JoinHandle`, then report `idx` on `death_tx` — is
+    /// exactly what this exercises directly, panic included.
+    #[tokio::test]
+    async fn supervisor_reports_idx_when_watched_task_panics() {
+        let (death_tx, mut death_rx) = mpsc::channel::<usize>(1);
+        let idx = 7usize;
+
+        let handle = tokio::spawn(async { panic!("simulated pinger death") });
+        tokio::spawn(async move {
+            let _ = handle.await;
+            let _ = death_tx.send(idx).await;
+        });
+
+        let got = death_rx.recv().await;
+        assert_eq!(got, Some(idx));
+    }
+
+    /// Same wiring, but for a clean early return rather than a panic — the
+    /// ping loop's own normal exit path (`tx.send(..).await` failing) is
+    /// exactly this shape once `main`'s receiver is gone.
+    #[tokio::test]
+    async fn supervisor_reports_idx_when_watched_task_returns_normally() {
+        let (death_tx, mut death_rx) = mpsc::channel::<usize>(1);
+        let idx = 3usize;
+
+        let handle = tokio::spawn(async {});
+        tokio::spawn(async move {
+            let _ = handle.await;
+            let _ = death_tx.send(idx).await;
+        });
+
+        let got = death_rx.recv().await;
+        assert_eq!(got, Some(idx));
+    }
 }

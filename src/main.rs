@@ -7,29 +7,34 @@ use std::time::{Duration, Instant, SystemTime};
 
 use clap::Parser;
 
-use display::{Display, OUTAGE_THRESHOLD};
-use pinger::PingEvent;
+use display::{Display, MultiTargetRow, OUTAGE_THRESHOLD};
+use pinger::{PingEvent, TaggedEvent};
 use stats::{Sample, Stats};
 
 /// ekg — compact in-place ping monitor.
 #[derive(Parser, Debug)]
 #[command(name = "ekg", version, about = "Compact in-place ping monitor")]
 struct Args {
-    /// Target host or IP to ping.
+    /// Target host(s) or IP(s) to ping. Give more than one to monitor
+    /// several targets side by side (e.g. a router and the open internet,
+    /// to see whose fault an outage is).
     #[arg(default_value = "1.1.1.1")]
-    host: String,
+    hosts: Vec<String>,
 
-    /// Ping interval in seconds (fractions allowed, e.g. 0.5).
+    /// Ping interval in seconds (fractions allowed, e.g. 0.5). Applies to
+    /// every target.
     #[arg(short, long, default_value_t = 1.0)]
     interval: f64,
 
     /// Rolling window size (number of samples kept for stats/sparkline).
+    /// Applies to every target.
     #[arg(short, long, default_value_t = 60)]
     window: usize,
 
-    /// Stop printing permanent outage lines after this many (0 disables them
-    /// entirely). The panel's "last outage" line and the final summary still
-    /// reflect every outage.
+    /// Stop printing permanent outage lines after this many per target (0
+    /// disables them entirely). The panel's "last outage" line and the
+    /// final summary still reflect every outage. With multiple targets the
+    /// cap notice itself still prints at most once overall.
     #[arg(short, long)]
     max_outages: Option<u32>,
 }
@@ -47,28 +52,66 @@ fn resolve_host(host: &str) -> std::io::Result<IpAddr> {
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "could not resolve host"))
 }
 
+/// Per-target runtime state: rolling stats plus the outage/recovery state
+/// machine that used to live as loose locals in `main` for a single target.
+/// One of these exists per CLI-supplied host.
+struct TargetRuntime {
+    host: String,
+    stats: Stats,
+    consecutive_timeouts: u32,
+    down_since: Option<Instant>,
+    down_wall_start: Option<SystemTime>,
+    last_recovery: Instant,
+    outage_count: u32,
+    /// Formatted "last outage: HH:MM:SS (Ns)" string, used verbatim on the
+    /// single-target panel's line 3.
+    last_outage_summary: Option<String>,
+}
+
+impl TargetRuntime {
+    fn new(host: String, window: usize, session_start: Instant) -> Self {
+        Self {
+            host,
+            stats: Stats::new(window),
+            consecutive_timeouts: 0,
+            down_since: None,
+            down_wall_start: None,
+            last_recovery: session_start,
+            outage_count: 0,
+            last_outage_summary: None,
+        }
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::io::Result<()> {
     let args = Args::parse();
 
-    let ip = match resolve_host(&args.host) {
-        Ok(ip) => ip,
-        Err(e) => {
-            eprintln!("ekg: could not resolve '{}': {e}", args.host);
-            std::process::exit(1);
+    let mut resolved: Vec<(String, IpAddr)> = Vec::with_capacity(args.hosts.len());
+    for host in &args.hosts {
+        match resolve_host(host) {
+            Ok(ip) => resolved.push((host.clone(), ip)),
+            Err(e) => {
+                eprintln!("ekg: could not resolve '{host}': {e}");
+                std::process::exit(1);
+            }
         }
-    };
+    }
 
-    let client = match pinger::create_client(ip) {
-        Ok(c) => c,
-        Err(msg) => {
-            eprintln!("ekg: {msg}");
-            std::process::exit(1);
+    let mut clients = Vec::with_capacity(resolved.len());
+    for (host, ip) in &resolved {
+        match pinger::create_client(*ip) {
+            Ok(c) => clients.push(c),
+            Err(msg) => {
+                eprintln!("ekg: {host}: {msg}");
+                std::process::exit(1);
+            }
         }
-    };
+    }
 
     let interval = Duration::from_secs_f64(args.interval.max(0.001));
-    let mut stats = Stats::new(args.window);
+    let multi = resolved.len() > 1;
+
     let mut display = Display::new();
     display.hide_cursor()?;
 
@@ -87,14 +130,24 @@ async fn main() -> std::io::Result<()> {
     }));
 
     let session_start = Instant::now();
-    let mut rx = pinger::spawn(client, ip, interval);
 
-    let mut consecutive_timeouts: u32 = 0;
-    let mut down_since: Option<Instant> = None;
-    let mut down_wall_start: Option<SystemTime> = None;
-    let mut last_recovery: Instant = session_start;
-    let mut outage_count: u32 = 0;
-    let mut last_outage_summary: Option<String> = None;
+    let mut targets: Vec<TargetRuntime> = resolved
+        .iter()
+        .map(|(host, _)| TargetRuntime::new(host.clone(), args.window, session_start))
+        .collect();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<TaggedEvent>(32.max(8 * resolved.len()));
+    let (death_tx, mut death_rx) = tokio::sync::mpsc::channel::<usize>(resolved.len().max(1));
+    for (idx, ((_, ip), client)) in resolved.iter().zip(clients.into_iter()).enumerate() {
+        pinger::spawn(client, *ip, interval, idx, tx.clone(), death_tx.clone());
+    }
+    drop(tx);
+    drop(death_tx);
+
+    // Shared (session-wide) state used only for the multi-target bottom
+    // line and for the cap notice, which prints at most once overall.
+    let mut shared_last_recovery: Instant = session_start;
+    let mut shared_last_outage_summary: Option<String> = None;
     let mut cap_notice_printed = false;
 
     let spark_count = 20usize;
@@ -103,84 +156,208 @@ async fn main() -> std::io::Result<()> {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 display.restore_cursor();
-                print_summary(&stats, session_start, outage_count);
+                print_summary(&targets, session_start);
                 break;
             }
+            maybe_dead = death_rx.recv() => {
+                // See pinger::spawn's doc comment: while this loop is
+                // running, a pinger task ending at all (return or panic)
+                // means that target's monitoring silently stopped. Without
+                // this, the shared channel only closes once *every* target's
+                // task has ended, so one dead target would otherwise leave
+                // its row frozen at stale "healthy" state forever while
+                // survivors keep rendering. Fail loud instead: restore the
+                // terminal (in case the death was a panic that already ran
+                // the panic hook and re-enabled line wrap — restoring again
+                // here is idempotent) and exit non-zero naming the target,
+                // before any further render can run.
+                if let Some(idx) = maybe_dead {
+                    display.restore_cursor();
+                    eprintln!(
+                        "\nekg: monitoring for '{}' stopped unexpectedly — exiting.",
+                        targets[idx].host
+                    );
+                    std::process::exit(1);
+                }
+            }
             maybe_event = rx.recv() => {
-                let event = match maybe_event {
+                let first = match maybe_event {
                     Some(e) => e,
-                    None => break, // pinger task ended
+                    None => break, // all pinger tasks ended
                 };
 
-                match event {
-                    PingEvent::Reply(_) => {
-                        if consecutive_timeouts >= OUTAGE_THRESHOLD {
-                            // Outage recovery: this reply ends a declared
-                            // outage, so uptime resets from here. A reply
-                            // after only a sub-threshold blip (1-2 timeouts,
-                            // never reached OUTAGE_THRESHOLD) is NOT a
-                            // recovery — uptime keeps counting from the
-                            // session start / last real outage.
-                            if let Some(started_wall) = down_wall_start {
-                                let duration = down_since
-                                    .map(|t| t.elapsed())
-                                    .unwrap_or_default();
-                                match args.max_outages {
-                                    Some(cap) if outage_count >= cap => {
-                                        if outage_count == cap && cap > 0 && !cap_notice_printed {
-                                            display.emit_notice_line(&format!(
-                                                "… outage log capped at {cap}; later outages still counted in the summary"
-                                            ))?;
-                                            cap_notice_printed = true;
-                                        }
-                                    }
-                                    _ => display.emit_outage_line(started_wall, duration)?,
-                                }
-                                last_outage_summary = Some(format!(
-                                    "last outage: {} ({})",
-                                    display::local_hms(started_wall),
-                                    fmt_short(duration)
-                                ));
-                                outage_count += 1;
-                            }
-                            last_recovery = Instant::now();
-                        }
-                        consecutive_timeouts = 0;
-                        down_since = None;
-                        down_wall_start = None;
-                    }
-                    PingEvent::Timeout => {
-                        consecutive_timeouts += 1;
-                        if consecutive_timeouts == OUTAGE_THRESHOLD {
-                            down_since = Some(Instant::now());
-                            down_wall_start = Some(SystemTime::now());
-                        }
-                    }
+                apply_event(
+                    &mut targets,
+                    &mut display,
+                    &args,
+                    multi,
+                    &mut shared_last_recovery,
+                    &mut shared_last_outage_summary,
+                    &mut cap_notice_printed,
+                    first,
+                )?;
+
+                // Drain any events that are already waiting so a backlog
+                // triggers one redraw per batch instead of one full
+                // clear+redraw per event (O(targets) work per event would
+                // otherwise become O(targets^2) per interval tick when
+                // every target's event lands close together). Outage
+                // bookkeeping/emission still happens per event, in order —
+                // only the panel redraw below is coalesced.
+                while let Ok(tagged) = rx.try_recv() {
+                    apply_event(
+                        &mut targets,
+                        &mut display,
+                        &args,
+                        multi,
+                        &mut shared_last_recovery,
+                        &mut shared_last_outage_summary,
+                        &mut cap_notice_printed,
+                        tagged,
+                    )?;
                 }
 
-                let sample: Sample = event.into();
-                stats.record(sample);
-
-                let down_for = down_since.map(|t| t.elapsed());
-                let uptime = if down_since.is_some() {
-                    None
+                if multi {
+                    render_multi_panel(&mut display, &targets, session_start, shared_last_recovery, shared_last_outage_summary.as_deref())?;
                 } else {
-                    Some(last_recovery.elapsed())
-                };
+                    let t = &targets[0];
+                    let down_for = t.down_since.map(|inst| inst.elapsed());
+                    let uptime = if t.down_since.is_some() {
+                        None
+                    } else {
+                        Some(t.last_recovery.elapsed())
+                    };
 
-                display.render(
-                    &args.host,
-                    &stats,
-                    down_for,
-                    uptime,
-                    last_outage_summary.as_deref(),
-                    spark_count,
-                )?;
+                    display.render_single(
+                        &t.host,
+                        &t.stats,
+                        down_for,
+                        uptime,
+                        t.last_outage_summary.as_deref(),
+                        spark_count,
+                    )?;
+                }
             }
         }
     }
 
     Ok(())
+}
+
+/// Applies one tagged ping event to its target's state: outage/recovery
+/// bookkeeping (including any permanent outage/notice line emission) and
+/// the rolling `Stats` record. Split out from the render step so a burst of
+/// pending events can all be applied before a single coalesced redraw
+/// (non-blocking's #3) — every event must still be applied so no outage
+/// transition is ever skipped, only the panel redraw is batched.
+#[allow(clippy::too_many_arguments)]
+fn apply_event(
+    targets: &mut [TargetRuntime],
+    display: &mut Display,
+    args: &Args,
+    multi: bool,
+    shared_last_recovery: &mut Instant,
+    shared_last_outage_summary: &mut Option<String>,
+    cap_notice_printed: &mut bool,
+    tagged: TaggedEvent,
+) -> std::io::Result<()> {
+    let TaggedEvent { idx, event } = tagged;
+    let t = &mut targets[idx];
+
+    match event {
+        PingEvent::Reply(_) => {
+            if t.consecutive_timeouts >= OUTAGE_THRESHOLD {
+                // Outage recovery: this reply ends a declared outage, so
+                // uptime resets from here. A reply after only a
+                // sub-threshold blip (1-2 timeouts, never reached
+                // OUTAGE_THRESHOLD) is NOT a recovery — uptime keeps
+                // counting from the session start / last real outage.
+                if let Some(started_wall) = t.down_wall_start {
+                    let duration = t.down_since.map(|inst| inst.elapsed()).unwrap_or_default();
+                    match args.max_outages {
+                        Some(cap) if t.outage_count >= cap => {
+                            if t.outage_count == cap && cap > 0 && !*cap_notice_printed {
+                                display.emit_notice_line(&format!(
+                                    "… outage log capped at {cap}; later outages still counted in the summary"
+                                ))?;
+                                *cap_notice_printed = true;
+                            }
+                        }
+                        _ => {
+                            let host_prefix = if multi { Some(t.host.as_str()) } else { None };
+                            display.emit_outage_line(host_prefix, started_wall, duration)?;
+                        }
+                    }
+                    t.last_outage_summary = Some(format!(
+                        "last outage: {} ({})",
+                        display::local_hms(started_wall),
+                        fmt_short(duration)
+                    ));
+                    *shared_last_outage_summary = Some(format!(
+                        "last outage: {} {} ({})",
+                        display::local_hms(started_wall),
+                        t.host,
+                        fmt_short(duration)
+                    ));
+                    t.outage_count += 1;
+                }
+                let now = Instant::now();
+                t.last_recovery = now;
+                *shared_last_recovery = now;
+            }
+            t.consecutive_timeouts = 0;
+            t.down_since = None;
+            t.down_wall_start = None;
+        }
+        PingEvent::Timeout => {
+            t.consecutive_timeouts += 1;
+            if t.consecutive_timeouts == OUTAGE_THRESHOLD {
+                t.down_since = Some(Instant::now());
+                t.down_wall_start = Some(SystemTime::now());
+            }
+        }
+    }
+
+    let sample: Sample = event.into();
+    targets[idx].stats.record(sample);
+
+    Ok(())
+}
+
+/// Builds and renders the multi-target panel: one row per target plus the
+/// shared bottom line (session-wide uptime + the most recent outage across
+/// any target).
+fn render_multi_panel(
+    display: &mut Display,
+    targets: &[TargetRuntime],
+    session_start: Instant,
+    shared_last_recovery: Instant,
+    shared_last_outage_summary: Option<&str>,
+) -> std::io::Result<()> {
+    let rows: Vec<MultiTargetRow> = targets
+        .iter()
+        .map(|t| MultiTargetRow {
+            host: &t.host,
+            stats: &t.stats,
+            down_since: t.down_since.map(|inst| inst.elapsed()),
+        })
+        .collect();
+
+    let any_down = targets.iter().any(|t| t.down_since.is_some());
+    let session_uptime = fmt_short(session_start.elapsed());
+    let shared_line = match (any_down, shared_last_outage_summary) {
+        (true, Some(outage)) => format!("  session {session_uptime} · down now · {outage}"),
+        (true, None) => format!("  session {session_uptime} · down now"),
+        (false, Some(outage)) => {
+            format!(
+                "  up {} · {outage}",
+                fmt_short(shared_last_recovery.elapsed())
+            )
+        }
+        (false, None) => format!("  up {}", fmt_short(shared_last_recovery.elapsed())),
+    };
+
+    display.render_multi(&rows, &shared_line)
 }
 
 fn fmt_short(d: Duration) -> String {
@@ -197,19 +374,26 @@ fn fmt_short(d: Duration) -> String {
     }
 }
 
-fn print_summary(stats: &Stats, session_start: Instant, outage_count: u32) {
+fn print_summary(targets: &[TargetRuntime], session_start: Instant) {
     let duration = session_start.elapsed();
     println!("\n--- ekg summary ---");
     println!("session duration: {}", fmt_short(duration));
-    println!("sent: {}  received: {}", stats.sent, stats.received);
-    println!("loss: {:.1}%", stats.lifetime_loss_pct());
-    if let (Some(avg), Some(min), Some(max)) = (stats.avg_rtt(), stats.min_rtt, stats.max_rtt) {
-        println!(
-            "avg: {}ms  min: {}ms  max: {}ms",
-            avg.as_millis(),
-            min.as_millis(),
-            max.as_millis()
-        );
+    for t in targets {
+        if targets.len() > 1 {
+            println!("\n{}:", t.host);
+        }
+        println!("sent: {}  received: {}", t.stats.sent, t.stats.received);
+        println!("loss: {:.1}%", t.stats.lifetime_loss_pct());
+        if let (Some(avg), Some(min), Some(max)) =
+            (t.stats.avg_rtt(), t.stats.min_rtt, t.stats.max_rtt)
+        {
+            println!(
+                "avg: {}ms  min: {}ms  max: {}ms",
+                avg.as_millis(),
+                min.as_millis(),
+                max.as_millis()
+            );
+        }
+        println!("outages: {}", t.outage_count);
     }
-    println!("outages: {outage_count}");
 }

@@ -85,6 +85,57 @@ fn first_fit(width: usize, candidates: &[String]) -> String {
         .unwrap_or_default()
 }
 
+/// Default sparkline width for a multi-target row before narrow-pane
+/// shrinking kicks in. Rows are more crowded than the single-target panel
+/// (host column + last-ms + avg/loss share the line), so this starts
+/// smaller than the single-target `spark_count` passed in from `main`.
+const SPARK_TARGET_COUNT: usize = 10;
+
+/// One target's live state, as needed to render its multi-target row.
+pub struct MultiTargetRow<'a> {
+    pub host: &'a str,
+    pub stats: &'a Stats,
+    pub down_since: Option<Duration>,
+}
+
+/// Computes the column width needed to left-align a set of host labels so
+/// the values that follow them line up across rows. Pure and unit-tested.
+pub fn host_column_width(hosts: &[&str]) -> usize {
+    hosts.iter().map(|h| h.chars().count()).max().unwrap_or(0)
+}
+
+/// Candidate row strings (widest-first) for an up/reachable target, used
+/// with `first_fit` for narrow-pane shortening: full detail (host padded to
+/// the column width, for cross-row alignment) first, then progressively
+/// shorter forms. Column alignment is a wide-pane luxury — the shortened
+/// candidates use the raw (unpadded) `host` so one long hostname among the
+/// targets doesn't defeat narrow-pane shortening for every row. Pure and
+/// unit-tested.
+pub fn up_row_candidates(
+    host: &str,
+    host_padded: &str,
+    last_ms: &str,
+    avg: &str,
+    loss_pct: f64,
+    spark: &str,
+) -> Vec<String> {
+    vec![
+        format!("{host_padded}  {last_ms}   avg {avg} · {loss_pct:.0}% · {spark}"),
+        format!("{host_padded}  {last_ms}   {spark}"),
+        format!("{host} {last_ms} {spark}"),
+    ]
+}
+
+/// Candidate row strings (widest-first) for a down/unreachable target. Same
+/// alignment-is-a-wide-pane-luxury rule as `up_row_candidates`: only the
+/// full candidate pads `host` to the column width. Pure and unit-tested.
+pub fn down_row_candidates(host: &str, host_padded: &str, duration_str: &str) -> Vec<String> {
+    vec![
+        format!("{host_padded}  no reply for {duration_str}"),
+        format!("{host}  no reply {duration_str}"),
+    ]
+}
+
 /// Renders the status panel in place and manages outage-line emission.
 pub struct Display {
     last_height: u16,
@@ -141,9 +192,13 @@ impl Display {
     }
 
     /// Prints a permanent outage summary line that scrolls into history,
-    /// above where the panel will resume.
+    /// above where the panel will resume. `host` is `None` in single-target
+    /// mode (output is byte-identical to before multi-target support) and
+    /// `Some(host)` in multi-target mode, which prefixes the line with the
+    /// host so outage history stays attributable per-target.
     pub fn emit_outage_line(
         &mut self,
+        host: Option<&str>,
         start_wall: std::time::SystemTime,
         duration: Duration,
     ) -> std::io::Result<()> {
@@ -152,10 +207,17 @@ impl Display {
         let end_local = local_hms(start_wall + duration);
         let mut out = stdout();
         out.queue(SetForegroundColor(Color::Red))?;
-        out.queue(Print(format!(
-            "✗ outage {start_local} → {end_local} ({})\n",
-            fmt_duration_short(duration)
-        )))?;
+        let line = match host {
+            Some(h) => format!(
+                "✗ {h}  outage {start_local} → {end_local} ({})\n",
+                fmt_duration_short(duration)
+            ),
+            None => format!(
+                "✗ outage {start_local} → {end_local} ({})\n",
+                fmt_duration_short(duration)
+            ),
+        };
+        out.queue(Print(line))?;
         out.queue(ResetColor)?;
         out.flush()?;
         Ok(())
@@ -173,9 +235,11 @@ impl Display {
         Ok(())
     }
 
-    /// Renders the (up to) 3-line panel in place.
+    /// Renders the (up to) 3-line single-target panel in place. Output is
+    /// byte-identical in structure to before multi-target support — this is
+    /// the common case and must not regress.
     #[allow(clippy::too_many_arguments)]
-    pub fn render(
+    pub fn render_single(
         &mut self,
         host: &str,
         stats: &Stats,
@@ -280,6 +344,79 @@ impl Display {
 
         out.flush()?;
         self.last_height = height;
+        Ok(())
+    }
+
+    /// Renders the multi-target panel: one condensed row per host, plus a
+    /// shared bottom line with session-wide info. Only used when there is
+    /// more than one target — the single-target format above is untouched.
+    pub fn render_multi(
+        &mut self,
+        rows: &[MultiTargetRow],
+        shared_line: &str,
+    ) -> std::io::Result<()> {
+        self.clear_panel()?;
+        let mut out = stdout();
+
+        let width = terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
+        let host_width = host_column_width(&rows.iter().map(|r| r.host).collect::<Vec<_>>());
+
+        for row in rows {
+            let host_padded = format!("{:<width$}", row.host, width = host_width);
+            let is_down = row.down_since.is_some();
+            let avg = row.stats.avg_rtt();
+            let avg_ms = avg.map(|d| d.as_secs_f64() * 1000.0);
+            let loss = row.stats.loss_pct();
+            let q = quality(avg_ms, loss, is_down);
+            let color = color_for(q);
+
+            if let Some(down_for) = row.down_since {
+                let d = fmt_duration_short(down_for);
+                let candidates = down_row_candidates(row.host, &host_padded, &d);
+                let line = first_fit(width.saturating_sub(2), &candidates);
+                out.queue(SetForegroundColor(color))?;
+                out.queue(Print(format!("✗ {line}\n")))?;
+                out.queue(ResetColor)?;
+            } else {
+                // "Current" is the most recent reply RTT, not the rolling
+                // average — they read the same in a flat window but must
+                // diverge whenever recent pings vary or a timeout dropped
+                // out of the average's window.
+                let last_ms = row
+                    .stats
+                    .last_reply_rtt()
+                    .map(fmt_ms)
+                    .unwrap_or_else(|| "--".to_string());
+                let avg_str = avg.map(fmt_ms).unwrap_or_else(|| "--".to_string());
+
+                // Shrink the sparkline to the columns actually available,
+                // mirroring the single-target narrow-pane approach.
+                let prefix_len = 2 + host_padded.chars().count() + 2 + last_ms.chars().count() + 3;
+                let available = width.saturating_sub(prefix_len + 2);
+                let spark_full = SPARK_TARGET_COUNT.min(available);
+                let buckets = row.stats.sparkline_buckets(spark_full.max(1));
+                let spark: String = buckets
+                    .iter()
+                    .map(|b| match b {
+                        Some(level) => SPARK_CHARS[*level as usize],
+                        None => TIMEOUT_GAP_CHAR,
+                    })
+                    .collect();
+
+                let candidates =
+                    up_row_candidates(row.host, &host_padded, &last_ms, &avg_str, loss, &spark);
+                let line = first_fit(width.saturating_sub(2), &candidates);
+                out.queue(SetForegroundColor(color))?;
+                out.queue(Print("● "))?;
+                out.queue(ResetColor)?;
+                out.queue(Print(format!("{line}\n")))?;
+            }
+        }
+
+        out.queue(Print(format!("{shared_line}\n")))?;
+
+        out.flush()?;
+        self.last_height = rows.len() as u16 + 1;
         Ok(())
     }
 }
@@ -390,5 +527,78 @@ mod tests {
     #[test]
     fn empty_candidates_yield_empty_string() {
         assert_eq!(first_fit(10, &[]), "");
+    }
+}
+
+#[cfg(test)]
+mod multi_target_tests {
+    use super::{down_row_candidates, host_column_width, up_row_candidates};
+
+    #[test]
+    fn host_column_width_picks_the_longest() {
+        assert_eq!(host_column_width(&["1.1.1.1", "192.168.1.1", "a"]), 11);
+    }
+
+    #[test]
+    fn host_column_width_empty_is_zero() {
+        assert_eq!(host_column_width(&[]), 0);
+    }
+
+    #[test]
+    fn host_column_width_single_host() {
+        assert_eq!(host_column_width(&["router.local"]), 12);
+    }
+
+    #[test]
+    fn up_row_full_candidate_has_avg_and_loss() {
+        let width = host_column_width(&["1.1.1.1", "192.168.1.1"]);
+        let host_padded = format!("{:<width$}", "1.1.1.1", width = width);
+        let candidates = up_row_candidates("1.1.1.1", &host_padded, "12ms", "14ms", 0.0, "▁▂▂▃▂");
+        assert_eq!(
+            candidates[0],
+            format!("{host_padded}  12ms   avg 14ms · 0% · ▁▂▂▃▂")
+        );
+        assert!(candidates[0].contains("avg 14ms"));
+        assert!(candidates[0].contains("0%"));
+    }
+
+    #[test]
+    fn up_row_short_candidate_drops_avg_and_loss() {
+        let host_padded = "1.1.1.1".to_string();
+        let candidates = up_row_candidates("1.1.1.1", &host_padded, "12ms", "14ms", 0.0, "▁▂▂▃▂");
+        assert_eq!(candidates[1], format!("{host_padded}  12ms   ▁▂▂▃▂"));
+        assert!(!candidates[1].contains("avg"));
+        assert!(!candidates[1].contains('%'));
+    }
+
+    #[test]
+    fn up_row_tersest_candidate_drops_host_padding() {
+        // A long hostname among the targets pads `host_padded` far beyond
+        // the raw host — the tersest candidate must use the raw host so a
+        // short-named row doesn't inherit the long one's width penalty.
+        let width = host_column_width(&["a", "a-very-long-router-hostname.local"]);
+        let host_padded = format!("{:<width$}", "a", width = width);
+        assert!(
+            host_padded.len() > 1,
+            "padded host should be wider than raw"
+        );
+        let candidates = up_row_candidates("a", &host_padded, "12ms", "14ms", 0.0, "▁▂▂▃▂");
+        assert_eq!(candidates[2], "a 12ms ▁▂▂▃▂");
+        assert!(candidates[2].len() < host_padded.len() + 20);
+    }
+
+    #[test]
+    fn down_row_full_candidate_has_for() {
+        let candidates = down_row_candidates("192.168.1.1", "192.168.1.1", "12s");
+        assert_eq!(candidates[0], "192.168.1.1  no reply for 12s");
+    }
+
+    #[test]
+    fn down_row_short_candidate_drops_for_and_padding() {
+        let width = host_column_width(&["192.168.1.1", "a-very-long-router-hostname.local"]);
+        let host_padded = format!("{:<width$}", "192.168.1.1", width = width);
+        let candidates = down_row_candidates("192.168.1.1", &host_padded, "12s");
+        assert_eq!(candidates[1], "192.168.1.1  no reply 12s");
+        assert!(candidates[1].len() < host_padded.len() + 20);
     }
 }

@@ -49,6 +49,18 @@ impl Stats {
         self.samples.push_back(sample);
     }
 
+    /// The most recent reply RTT in the rolling window — i.e. the "current"
+    /// reading, as distinct from `avg_rtt`'s rolling average. Skips over any
+    /// trailing timeouts to find the last successful reply; `None` only if
+    /// there is no reply anywhere in the window (e.g. every sample so far
+    /// has timed out).
+    pub fn last_reply_rtt(&self) -> Option<Duration> {
+        self.samples.iter().rev().find_map(|s| match s {
+            Sample::Reply(d) => Some(*d),
+            Sample::Timeout => None,
+        })
+    }
+
     /// Average RTT over the rolling window (replies only). `None` if no
     /// replies are in the window.
     pub fn avg_rtt(&self) -> Option<Duration> {
@@ -270,6 +282,36 @@ mod tests {
         }
         let buckets = s.sparkline_buckets(3);
         assert_eq!(buckets.len(), 3);
+    }
+
+    #[test]
+    fn last_reply_rtt_is_most_recent_reply() {
+        let mut s = Stats::new(5);
+        s.record(Sample::Reply(ms(10)));
+        s.record(Sample::Reply(ms(20)));
+        assert_eq!(s.last_reply_rtt().unwrap(), ms(20));
+    }
+
+    #[test]
+    fn last_reply_rtt_skips_trailing_timeouts() {
+        let mut s = Stats::new(5);
+        s.record(Sample::Reply(ms(30)));
+        s.record(Sample::Timeout);
+        s.record(Sample::Timeout);
+        // The rolling average would be 30ms too (only reply in window), but
+        // last_reply_rtt must independently walk from the back rather than
+        // reuse avg_rtt — this test would still pass a buggy alias, so the
+        // display-layer regression test (not here) is what actually pins
+        // "current != avg"; this test just pins the timeout-skipping search.
+        assert_eq!(s.last_reply_rtt().unwrap(), ms(30));
+    }
+
+    #[test]
+    fn last_reply_rtt_none_when_all_timeouts() {
+        let mut s = Stats::new(5);
+        s.record(Sample::Timeout);
+        s.record(Sample::Timeout);
+        assert!(s.last_reply_rtt().is_none());
     }
 
     #[test]
