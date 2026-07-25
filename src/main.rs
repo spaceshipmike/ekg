@@ -1,4 +1,5 @@
 mod display;
+mod hooks;
 mod pinger;
 mod recorder;
 mod stats;
@@ -62,6 +63,22 @@ struct Args {
     /// every line, so an overnight run's log survives an interruption.
     #[arg(long)]
     log: Option<PathBuf>,
+
+    /// Run this command (via `$SHELL -c`, falling back to `sh -c`) when an
+    /// outage is declared. Spawned detached — it never blocks the ping loop
+    /// even if the command hangs — with its stdin/stdout/stderr discarded so
+    /// its output can't corrupt the panel. Gets EKG_HOST and
+    /// EKG_OUTAGE_START (ms since the Unix epoch) in its environment.
+    /// Useful for push notifications (ntfy, Pushover), external logging, or
+    /// automations like power-cycling a router.
+    #[arg(long)]
+    on_outage: Option<String>,
+
+    /// Run this command (same shell/detach/env semantics as --on-outage)
+    /// when an outage recovers. Gets EKG_HOST, EKG_OUTAGE_START, and
+    /// EKG_OUTAGE_SECS (whole seconds the outage lasted).
+    #[arg(long)]
+    on_recovery: Option<String>,
 }
 
 /// Resolves the host argument to an IP address, accepting either a literal
@@ -403,6 +420,14 @@ fn apply_event(
                     if let Some(rec) = recorder.as_mut() {
                         rec.log_outage_end(&t.host, started_wall + duration, duration)?;
                     }
+                    // --on-recovery: fired regardless of the --max-outages
+                    // display cap too, same reasoning as the recorder above
+                    // — a hook consumer wants every recovery, not just the
+                    // ones that also got a terminal line.
+                    if let Some(cmd) = args.on_recovery.as_deref() {
+                        let env = hooks::recovery_env(&t.host, started_wall, duration);
+                        hooks::spawn_hook(cmd, &env);
+                    }
                     match args.max_outages {
                         Some(cap) if t.outage_count >= cap => {
                             if t.outage_count == cap && cap > 0 && !*cap_notice_printed {
@@ -446,6 +471,10 @@ fn apply_event(
                 t.down_wall_start = Some(wall_now);
                 if let Some(rec) = recorder.as_mut() {
                     rec.log_outage_start(&t.host, wall_now)?;
+                }
+                if let Some(cmd) = args.on_outage.as_deref() {
+                    let env = hooks::outage_env(&t.host, wall_now);
+                    hooks::spawn_hook(cmd, &env);
                 }
             }
         }

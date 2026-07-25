@@ -22,6 +22,7 @@ ekg pings a host and renders a small status panel that updates **in place** — 
 - **Quality color** — green / yellow / red by latency and loss
 - **Outage log** — one permanent line per connection drop, with start time and duration; cap or disable with `-m`
 - **Recorder** — `--log file.jsonl` appends every sample and outage event as JSON, for scripting or offline analysis
+- **Outage hooks** — `--on-outage` / `--on-recovery` run a shell command when the connection drops/comes back, for push notifications or automations
 - **Scripted runs** — `-c N` sends N pings and exits with a loss-based status code, no interactive session needed
 - **No sudo** — uses unprivileged ICMP datagram sockets
 - **Fast and tiny** — single static binary, four dependencies
@@ -37,6 +38,8 @@ ekg -m 5                # stop logging outage lines after 5 (0 = never log)
 ekg --log ping.jsonl    # append each sample + outage event as JSONL
 ekg -c 100              # send 100 pings, print summary, exit (0 = no loss)
 ekg -c 100 --max-loss 5 # same, but allow up to 5% loss and still exit 0
+ekg --on-outage 'ntfy publish home-net "down: $EKG_HOST"' \
+    --on-recovery 'ntfy publish home-net "up: $EKG_HOST after ${EKG_OUTAGE_SECS}s"'
 ```
 
 Ctrl-C prints a session summary: duration, sent/received, loss, min/avg/max, outage count. `-c`/`--count` prints
@@ -56,6 +59,29 @@ One JSON object per line, appended (not truncated) so an overnight run's data su
 
 `ts` is milliseconds since the Unix epoch. Sample lines have no `event` field; outage lines have no `rtt_ms`
 field — check for the field's presence, not a fixed schema, when parsing.
+
+### `--on-outage` / `--on-recovery` hooks
+
+Run an arbitrary command when an outage is declared and when it recovers — for push notifications, external
+logging, or automations (e.g. power-cycling a router):
+
+```bash
+ekg --on-outage 'ntfy publish home-net "ekg: $EKG_HOST is down"' \
+    --on-recovery 'ntfy publish home-net "ekg: $EKG_HOST recovered after ${EKG_OUTAGE_SECS}s"'
+```
+
+Each command runs via `$SHELL -c` (falling back to `sh -c` if `$SHELL` is unset) — the same shell you'd get
+in an interactive terminal, so pipes, quoting, and env var expansion all work as expected. It's spawned
+**detached**: stdin/stdout/stderr are discarded and the ping loop never waits on it, so a slow or hung command
+(a flaky notification API, a router that takes a while to reboot) can't stall monitoring or corrupt the panel.
+
+Env vars passed to the command:
+
+| Var | When | Meaning |
+| --- | --- | --- |
+| `EKG_HOST` | both | the target host/IP that changed state |
+| `EKG_OUTAGE_START` | both | outage start time, ms since the Unix epoch (same format as `--log`'s `ts`) |
+| `EKG_OUTAGE_SECS` | recovery only | whole seconds the outage lasted |
 
 ## Install
 
