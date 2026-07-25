@@ -94,7 +94,10 @@ Two safety bounds, so a flapping link can't pile up unbounded background work:
 
 Cleanup isn't only a timeout thing: when the command finishes normally (before 30s), ekg still sweeps its
 entire process group on the way out — so a command that backgrounds its own child and doesn't wait on it
-(`sleep 60 &`) doesn't leave that child running past the hook's own completion.
+(`sleep 60 &`) doesn't leave that child running past the hook's own completion. That sweep is two-stage: a
+`SIGTERM` first (a straggler that traps it for its own cleanup gets a real chance to use it), then, after a
+1-second grace period, an unconditional `SIGKILL` for anything still around — including a straggler that
+ignores `SIGTERM` entirely. Either way, nothing from a completed hook outlives it by more than a second.
 
 Env vars passed to the command:
 

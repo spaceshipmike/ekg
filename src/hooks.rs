@@ -103,19 +103,43 @@ const HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 /// Fixed by having the wrapper sweep its *entire* group on the way out,
 /// not just cancel the watchdog: after capturing the user command's exit
 /// status, it runs `trap '' TERM` (makes itself immune to `SIGTERM` — it's
-/// about to send that signal to its own group next, and would otherwise
-/// kill itself before it can report the right exit status) and then
-/// `kill -TERM -$$` (every remaining process sharing this group — the
-/// stray backgrounded child, the watchdog's orphaned `sleep`, anything
-/// else — dies; the trap is what lets the wrapper itself survive that same
-/// broadcast). Only then does it `exit` with the captured status. The
-/// timeout path is unaffected by any of this: `SIGKILL` can't be trapped,
-/// so when the watchdog fires, the whole group (wrapper included) dies
-/// instantly and none of this trailing cleanup code ever runs — it isn't
-/// needed there, since the group kill already got everything.
+/// about to send that signal to its own group next) and then `kill -TERM
+/// -$$` — a first, gentler pass, giving any straggler that traps
+/// `SIGTERM` for its own cleanup a chance to use it.
 ///
-/// Either way, ekg's side only needs a plain `child.wait()` on the wrapper
-/// process — the tree bounds, cleans up after, and terminates itself.
+/// `SIGTERM` alone isn't a complete guarantee, though: a straggler can
+/// just as easily *ignore* `SIGTERM` (a hook backgrounds something like
+/// `sh -c 'trap "" TERM; sleep 300'`), and would then survive
+/// indefinitely — a revision that stopped at the TERM sweep had exactly
+/// this gap. So after a short grace period (1s) for the TERM to take
+/// effect on anything that's going to honor it, the wrapper follows up
+/// with `kill -KILL -$$`. `SIGKILL` can't be trapped or ignored by
+/// anything, so this second pass is unconditional: whatever's left in the
+/// group, however stubborn, dies. The 1s grace is a deliberate trade —
+/// one extra second of single-flight occupancy per *completed* hook, in
+/// exchange for giving well-behaved stragglers (ones that trap `SIGTERM`
+/// to flush state, close a connection, etc.) a real chance at a clean
+/// shutdown instead of an unconditional `SIGKILL` every single time.
+///
+/// One consequence worth calling out: that final `kill -KILL -$$` also
+/// kills the wrapper *itself* (same group, and unlike `SIGTERM` this one
+/// isn't trapped) before it can reach `exit "$s"` — so on this path the
+/// wrapper's own reported exit status becomes "killed by SIGKILL" rather
+/// than the user command's real exit code. That's fine: ekg only ever
+/// does a bare `child.wait()` on the wrapper (see
+/// `spawn_hook_with_timeout`) and never inspects its exit status for
+/// anything, so nothing downstream depends on `$s` surviving that final
+/// kill.
+///
+/// The timeout path needs none of this: `SIGKILL` from the watchdog kills
+/// the whole group (wrapper included) instantly, so none of this trailing
+/// cleanup code ever runs there — it isn't needed, the group kill already
+/// got everything in one unconditional pass.
+///
+/// Either way — normal completion or the watchdog's own timeout — ekg's
+/// side only needs a plain `child.wait()` on the wrapper process; the
+/// tree bounds, cleans up after itself (however stubborn its
+/// descendants), and terminates on its own.
 ///
 /// Positional args, passed to `sh -c` as separate argv entries — never
 /// interpolated into this script's text — so arbitrary bytes in the user's
@@ -127,7 +151,7 @@ const HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 ///   - `$3` = timeout in seconds, as text (fractional allowed, e.g. `"0.05"`
 ///     — used by tests; production always passes [`HOOK_TIMEOUT`], which
 ///     formats as a plain integer, see `hook_timeout_formats_as_plain_integer_seconds`)
-const HOOK_WRAPPER: &str = r#""$1" -c "$2" & u=$!; ( sleep "$3"; kill -KILL -$$ ) 2>/dev/null & w=$!; wait "$u"; s=$?; kill "$w" 2>/dev/null; trap '' TERM; kill -TERM -$$ 2>/dev/null; exit "$s""#;
+const HOOK_WRAPPER: &str = r#""$1" -c "$2" & u=$!; ( sleep "$3"; kill -KILL -$$ ) 2>/dev/null & w=$!; wait "$u"; s=$?; kill "$w" 2>/dev/null; trap '' TERM; kill -TERM -$$ 2>/dev/null; sleep 1; kill -KILL -$$ 2>/dev/null; exit "$s""#;
 
 /// Owns the single-flight state for one target's `--on-outage` /
 /// `--on-recovery`. `main` creates one `Hooks` per monitored target (it
@@ -821,6 +845,136 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Pins the fix for the TERM-immunity gap a later review round caught:
+    /// the completion-path sweep originally sent only `SIGTERM`, which a
+    /// straggler can simply ignore (`sh -c 'trap "" TERM; sleep 300'`) and
+    /// then survive indefinitely — the wrapper still gets reaped and the
+    /// single-flight flag still clears, so a flapping link would
+    /// accumulate one TERM-immune process per outage forever, exactly the
+    /// "unbounded" outcome this whole module exists to prevent. `$!` after
+    /// the backgrounded `sh -c '...'` captures *that* process's pid (the
+    /// one that ignores TERM) as the thing to check — it doesn't matter
+    /// that its own `sleep 300` child is nested one level deeper; both
+    /// share the same process group and the group-wide kill reaches
+    /// either one. A long (30s) hook timeout again rules out the timeout
+    /// path as what's actually killing it — only the completion path's
+    /// follow-up `SIGKILL` (after HOOK_WRAPPER's 1s TERM grace) can be
+    /// responsible if it's dead well within that budget.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_hook_completion_kills_term_immune_backgrounded_child() {
+        let _guard = process_test_lock().lock().await;
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("ekg-hook-term-immune-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let running = Arc::new(AtomicBool::new(true));
+        let cmd = format!(
+            r#"sh -c 'trap "" TERM; sleep 300' & echo $! > {}"#,
+            path.display()
+        );
+        spawn_hook_with_timeout(&cmd, &[], Arc::clone(&running), Duration::from_secs(30));
+
+        let recorded = poll_until(TEST_POLL_BUDGET, || {
+            std::fs::read_to_string(&path)
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+        })
+        .await;
+        assert!(recorded, "TERM-immune child's pid was never recorded");
+        let immune_pid: u32 = std::fs::read_to_string(&path)
+            .unwrap()
+            .trim()
+            .parse()
+            .expect("recorded pid should be a plain integer");
+
+        let cleared = poll_until(TEST_POLL_BUDGET, || !running.load(Ordering::SeqCst)).await;
+        assert!(cleared, "hook never cleared the running flag");
+
+        let dead = poll_until(TEST_POLL_BUDGET, || !pid_alive(immune_pid)).await;
+        assert!(
+            dead,
+            "TERM-immune process (pid {immune_pid}) survived the hook's own completion — \
+             the completion-path sweep's SIGKILL follow-up isn't reaching it"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Same TERM-immunity repro as
+    /// `spawn_hook_completion_kills_term_immune_backgrounded_child`, but
+    /// through `dash` directly rather than whatever `sh` resolves to on
+    /// this machine — see `hook_wrapper_group_kill_works_under_dash`'s doc
+    /// comment for why that distinction matters (a bug in this exact area
+    /// previously passed every local/macOS run while failing on Ubuntu).
+    /// Confirms the SIGTERM-then-grace-then-SIGKILL sequence in
+    /// HOOK_WRAPPER behaves the same under dash's builtin `trap`/`kill`/
+    /// `wait` as it does under bash's.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hook_wrapper_kills_term_immune_child_under_dash() {
+        if !dash_available() {
+            eprintln!(
+                "skipping hook_wrapper_kills_term_immune_child_under_dash: no `dash` on PATH"
+            );
+            return;
+        }
+        let _guard = process_test_lock().lock().await;
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "ekg-hook-dash-term-immune-{}.txt",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let cmd = format!(
+            r#"sh -c 'trap "" TERM; sleep 300' & echo $! > {}"#,
+            path.display()
+        );
+        let mut command = Command::new("dash");
+        command
+            .arg("-c")
+            .arg(HOOK_WRAPPER)
+            .arg("sh")
+            .arg("sh")
+            .arg(&cmd)
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        command.process_group(0);
+
+        let mut child = command
+            .spawn()
+            .expect("dash should be spawnable — dash_available() already checked");
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+        });
+
+        let recorded = poll_until(TEST_POLL_BUDGET, || {
+            std::fs::read_to_string(&path)
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+        })
+        .await;
+        assert!(recorded, "TERM-immune child's pid was never recorded");
+        let immune_pid: u32 = std::fs::read_to_string(&path)
+            .unwrap()
+            .trim()
+            .parse()
+            .expect("recorded pid should be a plain integer");
+
+        let dead = poll_until(TEST_POLL_BUDGET, || !pid_alive(immune_pid)).await;
+        assert!(
+            dead,
+            "TERM-immune process (pid {immune_pid}) survived under dash — the SIGKILL \
+             follow-up isn't reaching it there"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Pins the other half of the same fix: an *ordinary* quick hook (no
     /// stray backgrounding by the user command at all) must still leave
     /// zero processes behind in its own group — specifically including the
@@ -943,6 +1097,22 @@ mod tests {
     /// A second event of the *same* kind after the first has finished must
     /// fire normally — single-flight only skips true overlap, it isn't a
     /// one-shot latch.
+    ///
+    /// The gate to wait on between the two `fire_outage` calls is the
+    /// single-flight flag itself (`hooks.outage_running`, readable here
+    /// since `tests` is a child module of `hooks` and the field isn't
+    /// `pub` outside the crate but is visible within it) — not the file
+    /// write. Those two things are no longer nearly-simultaneous now that
+    /// HOOK_WRAPPER's completion path does a TERM sweep, a 1s grace, and a
+    /// SIGKILL follow-up before it actually exits (see HOOK_WRAPPER's doc
+    /// comment): the user command's visible effect (the `echo`) lands
+    /// almost immediately, but the flag that actually gates a second
+    /// `fire_outage` doesn't clear until the wrapper's full cleanup
+    /// sequence finishes, roughly a second later. Firing again as soon as
+    /// the file write is observed — before the flag has actually
+    /// cleared — would just get silently skipped by single-flight, which
+    /// is exactly what happened here until this test was corrected to
+    /// wait on the real gate.
     #[cfg(unix)]
     #[tokio::test]
     async fn fire_outage_fires_again_after_previous_completes() {
@@ -957,6 +1127,13 @@ mod tests {
         assert!(
             poll_until(TEST_POLL_BUDGET, || line_count(&path) >= 1).await,
             "first invocation never completed"
+        );
+        assert!(
+            poll_until(TEST_POLL_BUDGET, || {
+                !hooks.outage_running.load(Ordering::SeqCst)
+            })
+            .await,
+            "first invocation's single-flight flag never cleared"
         );
         hooks.fire_outage(&cmd, &[]);
         assert!(
