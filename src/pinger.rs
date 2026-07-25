@@ -27,6 +27,14 @@ pub enum PingEvent {
     Timeout,
 }
 
+/// A `PingEvent` tagged with the index of the target it came from, so
+/// multiple per-target ping loops can multiplex onto one shared channel.
+#[derive(Debug, Clone, Copy)]
+pub struct TaggedEvent {
+    pub idx: usize,
+    pub event: PingEvent,
+}
+
 impl From<PingEvent> for Sample {
     fn from(e: PingEvent) -> Self {
         match e {
@@ -62,11 +70,19 @@ pub fn create_client(target: IpAddr) -> Result<Client, String> {
     })
 }
 
-/// Spawns the ping loop on the current tokio runtime and returns a receiver
-/// that yields one `PingEvent` per interval tick until the task ends.
-pub fn spawn(client: Client, host: IpAddr, interval: Duration) -> mpsc::Receiver<PingEvent> {
-    let (tx, rx) = mpsc::channel(8);
-
+/// Spawns the ping loop for one target on the current tokio runtime. Events
+/// are tagged with `idx` (the target's position in the CLI's target list)
+/// and sent over the shared `tx`, so any number of targets can multiplex
+/// their independent ping loops (each with its own client/socket) onto one
+/// channel that `main` selects over. The task ends (and drops its `tx`
+/// clone) when the receiver is gone.
+pub fn spawn(
+    client: Client,
+    host: IpAddr,
+    interval: Duration,
+    idx: usize,
+    tx: mpsc::Sender<TaggedEvent>,
+) {
     tokio::spawn(async move {
         let mut pinger = client
             .pinger(host, PingIdentifier(std::process::id() as u16))
@@ -86,11 +102,9 @@ pub fn spawn(client: Client, host: IpAddr, interval: Duration) -> mpsc::Receiver
                 Err(_) => PingEvent::Timeout,
             };
             seq = seq.wrapping_add(1);
-            if tx.send(event).await.is_err() {
+            if tx.send(TaggedEvent { idx, event }).await.is_err() {
                 break;
             }
         }
     });
-
-    rx
 }
