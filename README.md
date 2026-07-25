@@ -79,10 +79,18 @@ gets to actually finish even if you Ctrl-C out of ekg right after triggering it.
 
 Two safety bounds, so a flapping link can't pile up unbounded background work:
 
-- **30s timeout** — a hook still running after 30 seconds is killed.
-- **Single-flight per hook kind** — if the previous `--on-outage` (or `--on-recovery`) invocation hasn't
-  finished yet, a new one is skipped rather than stacked. `--on-outage` and `--on-recovery` are tracked
-  independently, so one kind being in flight never blocks the other.
+- **30s timeout, enforced on the whole process tree, independent of ekg** — the command isn't run directly;
+  it's run inside a small watchdog wrapper that backgrounds it, waits, and — if 30 seconds pass first — sends
+  `SIGKILL` to the entire process group. Because the wrapper, the command, and anything the command itself
+  spawns (a pipeline, a child process) all share that one process group, the kill takes down the whole tree,
+  not just the immediate process. And because the watchdog lives inside the hook's own process tree rather
+  than as a task inside ekg, the timeout still fires even if ekg has already exited (Ctrl-C, or right after
+  the last `--count` ping) — a hung hook can't outlive ekg and run forever.
+- **Single-flight per target and per hook kind** — if the previous `--on-outage` for a given host is still
+  running when that host's next outage is declared, the new invocation is skipped rather than stacked; a
+  different host's `--on-outage` is entirely unaffected, since each target's single-flight state is separate.
+  `--on-outage` and `--on-recovery` are likewise tracked independently, so one kind being in flight never
+  blocks the other.
 
 Env vars passed to the command:
 

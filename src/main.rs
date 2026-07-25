@@ -69,10 +69,13 @@ struct Args {
     /// outage is declared. Spawned detached in its own process group — it
     /// never blocks the ping loop even if the command hangs, its
     /// stdin/stdout/stderr are discarded so its output can't corrupt the
-    /// panel, and it survives a Ctrl-C to ekg instead of dying with it.
-    /// Killed if still running after 30s. If a previous --on-outage
-    /// invocation is still running when a new outage is declared, the new
-    /// one is skipped (at most one in flight at a time). Gets EKG_HOST and
+    /// panel, and it survives a Ctrl-C to ekg instead of dying with it. The
+    /// whole process tree it spawns (pipelines, child processes) is killed
+    /// after 30s by a watchdog that lives inside that same tree, so the
+    /// timeout is enforced even if ekg has already exited. Single-flight
+    /// per target: if a previous --on-outage for this same host is still
+    /// running when a new outage is declared, the new one is skipped (a
+    /// different host's --on-outage is unaffected). Gets EKG_HOST and
     /// EKG_OUTAGE_START (ms since the Unix epoch) in its environment.
     /// Useful for push notifications (ntfy, Pushover), external logging, or
     /// automations like power-cycling a router.
@@ -80,9 +83,9 @@ struct Args {
     on_outage: Option<String>,
 
     /// Run this command (same shell/detach/timeout/single-flight semantics
-    /// as --on-outage, tracked independently) when an outage recovers. Gets
-    /// EKG_HOST, EKG_OUTAGE_START, and EKG_OUTAGE_SECS (whole seconds the
-    /// outage lasted).
+    /// as --on-outage, tracked independently per target and per hook kind)
+    /// when an outage recovers. Gets EKG_HOST, EKG_OUTAGE_START, and
+    /// EKG_OUTAGE_SECS (whole seconds the outage lasted).
     #[arg(long)]
     on_recovery: Option<String>,
 }
@@ -114,6 +117,11 @@ struct TargetRuntime {
     /// Formatted "last outage: HH:MM:SS (Ns)" string, used verbatim on the
     /// single-target panel's line 3.
     last_outage_summary: Option<String>,
+    /// This target's own `--on-outage`/`--on-recovery` single-flight state.
+    /// One `Hooks` per target (not one shared across the whole session) so
+    /// a slow hook for target A can never suppress target B's — see
+    /// hooks.rs's doc comment on `Hooks` for the full reasoning.
+    hooks: Hooks,
 }
 
 impl TargetRuntime {
@@ -127,6 +135,7 @@ impl TargetRuntime {
             last_recovery: session_start,
             outage_count: 0,
             last_outage_summary: None,
+            hooks: Hooks::new(),
         }
     }
 }
@@ -186,12 +195,6 @@ async fn main() -> std::io::Result<()> {
         },
         None => None,
     };
-
-    // --on-outage/--on-recovery single-flight state: one `Hooks` for the
-    // whole session, shared across every target (see hooks.rs's doc
-    // comment for why "single-flight, not per-target" is the chosen
-    // granularity).
-    let hooks = Hooks::new();
 
     let interval = Duration::from_secs_f64(args.interval.max(0.001));
     let multi = resolved.len() > 1;
@@ -287,7 +290,6 @@ async fn main() -> std::io::Result<()> {
                     &mut shared_last_outage_summary,
                     &mut cap_notice_printed,
                     &mut recorder,
-                    &hooks,
                     first,
                 )?;
 
@@ -308,7 +310,6 @@ async fn main() -> std::io::Result<()> {
                         &mut shared_last_outage_summary,
                         &mut cap_notice_printed,
                         &mut recorder,
-                        &hooks,
                         tagged,
                     )?;
                 }
@@ -401,7 +402,6 @@ fn apply_event(
     shared_last_outage_summary: &mut Option<String>,
     cap_notice_printed: &mut bool,
     recorder: &mut Option<Recorder>,
-    hooks: &Hooks,
     tagged: TaggedEvent,
 ) -> std::io::Result<()> {
     let TaggedEvent { idx, event } = tagged;
@@ -441,7 +441,7 @@ fn apply_event(
                     // ones that also got a terminal line.
                     if let Some(cmd) = args.on_recovery.as_deref() {
                         let env = hooks::recovery_env(&t.host, started_wall, duration);
-                        hooks.fire_recovery(cmd, &env);
+                        t.hooks.fire_recovery(cmd, &env);
                     }
                     match args.max_outages {
                         Some(cap) if t.outage_count >= cap => {
@@ -489,7 +489,7 @@ fn apply_event(
                 }
                 if let Some(cmd) = args.on_outage.as_deref() {
                     let env = hooks::outage_env(&t.host, wall_now);
-                    hooks.fire_outage(cmd, &env);
+                    t.hooks.fire_outage(cmd, &env);
                 }
             }
         }

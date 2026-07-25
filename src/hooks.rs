@@ -3,7 +3,7 @@
 //! it recovers — e.g. an ntfy/pushover push notification, an external log
 //! line, or an automation like power-cycling a router.
 //!
-//! Three properties the ping loop depends on, none of which a naive
+//! Four properties the ping loop depends on, none of which a naive
 //! `Command::spawn` + forget gives you for free:
 //!
 //! 1. **Never blocks the ping loop** — spawning is fire-and-forget; nothing
@@ -13,12 +13,13 @@
 //!    a Ctrl-C or terminal hangup that targets ekg's foreground process
 //!    group doesn't also kill a hook that's mid-flight (e.g. a slow
 //!    power-cycle command actually needs to run to completion).
-//! 3. **Never accumulates unbounded processes/tasks on a flapping link** — a
-//!    hard 30s timeout kills a hook that hangs (so its reaper task can't
-//!    live forever), and single-flight per hook kind skips a new spawn
-//!    while the previous invocation of that same kind is still running (so
-//!    a fast flap/recover/flap/recover cycle can't stack up N in-flight
-//!    hook processes).
+//! 3. **Never accumulates unbounded processes on a flapping link, even
+//!    across the whole tree a hook command spawns, and even if ekg itself
+//!    has already exited** — see [`HOOK_WRAPPER`]'s doc comment for how.
+//! 4. **A flap storm on one target can't starve another's hooks** —
+//!    single-flight (skip a new invocation while the previous one of the
+//!    same kind is still running) is tracked per *target*, not globally;
+//!    see `Hooks`'s doc comment.
 
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,24 +28,69 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::process::Command;
 
-/// Hard ceiling on how long a hook command may run before it's killed.
-/// Generous enough for a real notification API call or a router
-/// power-cycle script, but bounded so a hung command's reaper task can't
-/// live forever — see the module doc's point 3.
+/// Hard ceiling on how long a hook command (and everything it spawns) may
+/// run before the whole tree is killed. Generous enough for a real
+/// notification API call or a router power-cycle script, but bounded so a
+/// hung command can't accumulate forever — see the module doc's point 3.
 const HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Owns the single-flight state for `--on-outage` / `--on-recovery`. One
-/// instance lives for the whole session (created once in `main`), separate
-/// from a bare pair of module-level statics so tests can each get their own
-/// isolated instance instead of racing on shared global state.
+/// A POSIX `sh` script that runs the user's hook command with the whole
+/// resulting process tree bounded by a timeout that's enforced **inside
+/// that same tree**, not by ekg watching over it.
 ///
-/// Single-flight is tracked **per hook kind across the whole session, not
-/// per target**: with multiple `--host`s, a slow `--on-outage` for one
-/// target still suppresses a concurrent `--on-outage` for a different
-/// target. That's deliberate for the notification use case this feature
-/// targets — a multi-target flap storm (e.g. a router blip that drops every
-/// target at once) should still produce "at most one in-flight
-/// notification command", not one per target piling up simultaneously.
+/// Earlier revisions had ekg's own tokio task `tokio::time::timeout` around
+/// `child.wait()` and, on expiry, kill just that one child pid. Two bugs
+/// followed from that design, both fixed by moving the timeout into the
+/// spawned tree itself:
+///
+/// - Only the immediate child died. A hook command that's a pipeline or a
+///   script spawning its own children (`cmd1 | cmd2`, a wrapper script that
+///   forks a helper) left those descendants running past the 30s deadline —
+///   and since the single-flight flag cleared once the immediate child was
+///   reaped, a flapping link could still accumulate an unbounded number of
+///   surviving grandchildren over time.
+/// - The watchdog was a tokio task living inside ekg's own process. If ekg
+///   exits (Ctrl-C, or immediately after the last `--count` event) while a
+///   hook is still running, that task is dropped with it — a hung detached
+///   hook then runs forever, exactly the guarantee `--on-outage`/
+///   `--on-recovery` are documented as providing.
+///
+/// This script is spawned instead of the raw user command, as the process
+/// group leader (`process_group(0)`, set by [`spawn_hook_with_timeout`]).
+/// It backgrounds the user's command, backgrounds a watchdog subshell that
+/// sleeps for the timeout and then sends `SIGKILL` to the *entire process
+/// group* (`kill -KILL -- -$$`, negative pgid) — which, because everything
+/// in the tree inherited the same pgid, takes down the user command and any
+/// children/grandchildren it spawned along with the wrapper and the
+/// watchdog itself. That kill happens from a process that's part of the
+/// hook's own tree, independent of ekg's tokio runtime or even ekg still
+/// existing, so it fires whether or not ekg is still around to see it.
+/// Once the user command finishes on its own, the wrapper cancels the
+/// watchdog and exits with the user command's exit status; ekg's side then
+/// only needs a plain `child.wait()` on the wrapper process — the tree
+/// bounds and terminates itself.
+///
+/// Positional args, passed to `sh -c` as separate argv entries — never
+/// interpolated into this script's text — so arbitrary bytes in the user's
+/// command (quotes, `$`, backticks, newlines, anything) can't break out of
+/// `"$2"` and corrupt the wrapper's own syntax:
+///   - `$0` = `"sh"` (conventional placeholder, unused)
+///   - `$1` = the shell that runs the user's command (`$SHELL`, or `sh`)
+///   - `$2` = the user's command string, passed verbatim to `"$1" -c`
+///   - `$3` = timeout in seconds, as text (fractional allowed, e.g. `"0.05"`
+///     — used by tests; production always passes [`HOOK_TIMEOUT`])
+const HOOK_WRAPPER: &str = r#""$1" -c "$2" & u=$!; ( sleep "$3"; kill -KILL -- -$$ ) 2>/dev/null & w=$!; wait "$u"; s=$?; kill "$w" 2>/dev/null; exit "$s""#;
+
+/// Owns the single-flight state for one target's `--on-outage` /
+/// `--on-recovery`. `main` creates one `Hooks` per monitored target (it
+/// lives inside that target's `TargetRuntime`) rather than one shared
+/// across the whole session — `EKG_HOST` identifies which target changed
+/// state, and a slow `--on-outage` for target A silently swallowing a
+/// concurrent `--on-outage` for target B (a different host, a genuinely
+/// separate event worth its own notification) would be a real loss, not a
+/// convenience. Single-flight only within one target's own history of a
+/// given hook kind — "don't stack repeated notifications for the *same*
+/// flapping link" — is the actual goal.
 pub struct Hooks {
     outage_running: Arc<AtomicBool>,
     recovery_running: Arc<AtomicBool>,
@@ -154,11 +200,11 @@ fn fire(cmd: &str, env: &[(String, String)], running: Arc<AtomicBool>) {
     spawn_hook_with_timeout(cmd, env, running, HOOK_TIMEOUT);
 }
 
-/// Spawns `cmd` via `$SHELL -c` (falling back to `sh -c` if `$SHELL` is
-/// unset), with `env` applied on top of the inherited environment, detached
-/// from the ping loop in its own process group. Must be called from within
-/// a Tokio runtime (it is, from `apply_event`, itself always called from
-/// the async main loop).
+/// Spawns [`HOOK_WRAPPER`] (which in turn runs `cmd` via `$SHELL -c`,
+/// falling back to `sh -c` if `$SHELL` is unset), with `env` applied on top
+/// of the inherited environment, detached from the ping loop in its own
+/// process group. Must be called from within a Tokio runtime (it is, from
+/// `apply_event`, itself always called from the async main loop).
 ///
 /// Spawn failures (bad `$SHELL`, command not found, etc.) are silently
 /// dropped rather than surfaced — a broken hook must never crash ekg or
@@ -169,11 +215,21 @@ fn spawn_hook_with_timeout(
     running: Arc<AtomicBool>,
     timeout: Duration,
 ) {
-    let sh = resolve_shell(std::env::var("SHELL").ok());
-    let mut command = Command::new(&sh);
+    let user_shell = resolve_shell(std::env::var("SHELL").ok());
+    // The wrapper is always run via plain `sh`, not the user's `$SHELL` —
+    // its own syntax (backgrounding, `wait pid`, `kill -- -$$`) is
+    // deliberately kept to portable POSIX `sh` so it behaves the same
+    // regardless of what shell the user has configured; `$SHELL` is only
+    // used *inside* the wrapper, to run the user's actual command as
+    // before.
+    let mut command = Command::new("sh");
     command
         .arg("-c")
-        .arg(cmd)
+        .arg(HOOK_WRAPPER)
+        .arg("sh") // $0 — conventional, unused by the script
+        .arg(&user_shell) // $1
+        .arg(cmd) // $2
+        .arg(timeout.as_secs_f64().to_string()) // $3
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -181,13 +237,16 @@ fn spawn_hook_with_timeout(
         command.env(k, v);
     }
     // Own process group: a SIGINT from Ctrl-C (or a hangup) targets ekg's
-    // foreground process group, which the child would otherwise inherit and
-    // die alongside — silently truncating a slow notification or a
-    // power-cycle command exactly when the user disconnects and most wants
-    // it to keep running. `process_group(0)` makes the child its own group
-    // leader instead. Unix-only API; ekg only ships for macOS/Linux (see
-    // README/CI), so no other-platform fallback is needed.
-    // tokio::process::Command defines `process_group` natively (mirroring
+    // foreground process group, which the wrapper (and everything it
+    // spawns) would otherwise inherit and die alongside — silently
+    // truncating a slow notification or a power-cycle command exactly when
+    // the user disconnects and most wants it to keep running.
+    // `process_group(0)` makes the wrapper its own group leader instead,
+    // which doubles as the mechanism HOOK_WRAPPER's internal timeout uses
+    // to kill its whole tree (`kill -- -$$` targets this same group).
+    // Unix-only API; ekg only ships for macOS/Linux (see README/CI), so no
+    // other-platform fallback is needed. tokio::process::Command defines
+    // `process_group` natively (mirroring
     // std::os::unix::process::CommandExt) rather than requiring that trait
     // in scope.
     #[cfg(unix)]
@@ -198,22 +257,18 @@ fn spawn_hook_with_timeout(
         return;
     };
 
-    // Reap the child on a detached background task instead of a bare
+    // Reap the wrapper on a detached background task instead of a bare
     // `Child` drop — dropping without waiting leaves a zombie process until
     // ekg itself exits, which would slowly accumulate over a long-running
-    // (overnight, multi-day) monitoring session with repeated outages. The
-    // `timeout` wrapper is what bounds that task's own lifetime: without
-    // it, a hook command that hangs forever (a notification API that never
-    // responds) would leave this task — and the single-flight `running`
-    // flag — stuck forever too, permanently wedging that hook kind. On
-    // timeout we kill the child by pid (works regardless of process group,
-    // since `start_kill` targets the specific pid) and still await it so
-    // it's reaped rather than left a zombie.
+    // (overnight, multi-day) monitoring session with repeated outages. No
+    // timeout wrapper needed here: HOOK_WRAPPER's own internal watchdog
+    // bounds and self-terminates the whole process tree (including any
+    // children the user command spawns) independent of this task, so a
+    // plain wait is enough — and correct even if ekg exits before this
+    // task ever runs again, since the watchdog lives inside the hook's own
+    // tree, not ekg's.
     tokio::spawn(async move {
-        if tokio::time::timeout(timeout, child.wait()).await.is_err() {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        }
+        let _ = child.wait().await;
         running.store(false, Ordering::SeqCst);
     });
 }
@@ -368,6 +423,76 @@ mod tests {
         assert!(cleared, "timeout kill never cleared the running flag");
     }
 
+    /// Checks whether a process is still alive via `kill -0`, the standard
+    /// liveness probe — a zero exit means the pid exists (and is signalable
+    /// by us), a nonzero exit means it doesn't. Uses `std::process::Command`
+    /// synchronously (fine for a short-lived test-only check) rather than
+    /// pulling in a `libc`/`nix` dependency just to call `kill(pid, 0)`
+    /// directly.
+    fn pid_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Pins the fix for the group-kill bug: the timeout must kill the
+    /// *entire* process group the wrapper leads, not just its immediate
+    /// child. `sleep 60 &` backgrounds a grandchild (relative to
+    /// `spawn_hook_with_timeout`'s own child, the wrapper) that a naive
+    /// "kill just the wrapper's pid" implementation would leave running
+    /// indefinitely past the timeout. The grandchild's own pid is recorded
+    /// to a file (via `$!`) so the test can check it directly, independent
+    /// of the wrapper process's fate.
+    #[tokio::test]
+    async fn spawn_hook_kills_whole_group_including_grandchildren() {
+        let _guard = process_test_lock().lock().await;
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "ekg-hook-grandchild-pid-{}.txt",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let running = Arc::new(AtomicBool::new(true));
+        let cmd = format!("sleep 60 & echo $! > {}; wait", path.display());
+        spawn_hook_with_timeout(&cmd, &[], Arc::clone(&running), Duration::from_millis(100));
+
+        let recorded = poll_until(Duration::from_secs(3), || {
+            std::fs::read_to_string(&path)
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+        })
+        .await;
+        assert!(recorded, "grandchild pid was never recorded");
+        let grandchild_pid: u32 = std::fs::read_to_string(&path)
+            .unwrap()
+            .trim()
+            .parse()
+            .expect("recorded pid should be a plain integer");
+        assert!(
+            pid_alive(grandchild_pid),
+            "grandchild should still be alive right after it's recorded, before the timeout fires"
+        );
+
+        // The 100ms timeout fires well before the grandchild's own 60s
+        // sleep would end naturally — if it's gone by the time this poll
+        // succeeds (comfortably within budget), that's the group kill, not
+        // a coincidental natural exit.
+        let dead = poll_until(Duration::from_secs(3), || !pid_alive(grandchild_pid)).await;
+        assert!(
+            dead,
+            "grandchild process (pid {grandchild_pid}) survived the timeout — group kill isn't reaching it"
+        );
+        assert!(!running.load(Ordering::SeqCst));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Behavioral test of `Hooks`' single-flight gate: firing the same kind
     /// twice back-to-back while the first is still running (a slow command)
     /// must result in only one execution, not two stacked ones.
@@ -456,6 +581,54 @@ mod tests {
         })
         .await;
         assert!(outage_ran, "outage hook never ran");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Per-target independence (the fix for the third review round's
+    /// single-flight bug): `main` now gives each target its own `Hooks`
+    /// instance rather than sharing one across the whole session. This test
+    /// pins that separate instances never suppress each other — a slow
+    /// `--on-outage` "in flight" for one target's `Hooks` must not skip a
+    /// concurrent `--on-outage` fired on a *different* target's `Hooks`,
+    /// the way it would if the flag were shared/global.
+    #[tokio::test]
+    async fn separate_hooks_instances_do_not_share_single_flight_state() {
+        let _guard = process_test_lock().lock().await;
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("ekg-hook-per-target-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        // Two independent `Hooks`, standing in for two `TargetRuntime`s'
+        // worth of state (host A and host B).
+        let host_a = Hooks::new();
+        let host_b = Hooks::new();
+        let slow_cmd = format!("sleep 0.4 && echo a >> {}", path.display());
+        let fast_cmd = format!("echo b >> {}", path.display());
+
+        host_a.fire_outage(&slow_cmd, &[]); // still "running" on host_a's Hooks
+        host_b.fire_outage(&fast_cmd, &[]); // must not be skipped by host_a's flag
+
+        // If single-flight state were (incorrectly) shared, host_b's fire
+        // would have been dropped and "b" would never show up.
+        let host_b_ran = poll_until(Duration::from_secs(3), || {
+            std::fs::read_to_string(&path)
+                .unwrap_or_default()
+                .contains('b')
+        })
+        .await;
+        assert!(
+            host_b_ran,
+            "host_b's hook never ran — single-flight state leaked across targets"
+        );
+
+        let host_a_ran = poll_until(Duration::from_secs(5), || {
+            std::fs::read_to_string(&path)
+                .unwrap_or_default()
+                .contains('a')
+        })
+        .await;
+        assert!(host_a_ran, "host_a's hook never ran");
 
         let _ = std::fs::remove_file(&path);
     }
