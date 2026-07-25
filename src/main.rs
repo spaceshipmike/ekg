@@ -1,14 +1,17 @@
 mod display;
 mod pinger;
+mod recorder;
 mod stats;
 
 use std::net::{IpAddr, ToSocketAddrs};
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use clap::Parser;
 
 use display::{Display, MultiTargetRow, OUTAGE_THRESHOLD};
 use pinger::{PingEvent, TaggedEvent};
+use recorder::Recorder;
 use stats::{Sample, Stats};
 
 /// ekg — compact in-place ping monitor.
@@ -37,6 +40,24 @@ struct Args {
     /// cap notice itself still prints at most once overall.
     #[arg(short, long)]
     max_outages: Option<u32>,
+
+    /// Send this many pings per target, then print the summary and exit
+    /// (instead of running until Ctrl-C). Exit code reflects whether loss
+    /// stayed within --max-loss.
+    #[arg(short = 'c', long)]
+    count: Option<u64>,
+
+    /// With --count, the maximum lifetime loss percentage still considered
+    /// a success (exit code 0). Default 0: any packet loss at all is a
+    /// failing run. Ignored without --count.
+    #[arg(long, default_value_t = 0.0)]
+    max_loss: f64,
+
+    /// Append each ping sample, plus outage start/end events, to this file
+    /// as newline-delimited JSON. Opened in append mode and flushed after
+    /// every line, so an overnight run's log survives an interruption.
+    #[arg(long)]
+    log: Option<PathBuf>,
 }
 
 /// Resolves the host argument to an IP address, accepting either a literal
@@ -108,6 +129,17 @@ async fn main() -> std::io::Result<()> {
             }
         }
     }
+
+    let mut recorder: Option<Recorder> = match &args.log {
+        Some(path) => match Recorder::open(path) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eprintln!("ekg: could not open log file '{}': {e}", path.display());
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
 
     let interval = Duration::from_secs_f64(args.interval.max(0.001));
     let multi = resolved.len() > 1;
@@ -194,6 +226,7 @@ async fn main() -> std::io::Result<()> {
                     &mut shared_last_recovery,
                     &mut shared_last_outage_summary,
                     &mut cap_notice_printed,
+                    &mut recorder,
                     first,
                 )?;
 
@@ -213,6 +246,7 @@ async fn main() -> std::io::Result<()> {
                         &mut shared_last_recovery,
                         &mut shared_last_outage_summary,
                         &mut cap_notice_printed,
+                        &mut recorder,
                         tagged,
                     )?;
                 }
@@ -237,11 +271,35 @@ async fn main() -> std::io::Result<()> {
                         spark_count,
                     )?;
                 }
+
+                // --count: once every target has sent at least that many
+                // pings, stop like a scripted one-shot run — print the
+                // normal summary and exit with a code that reflects whether
+                // loss stayed within --max-loss, so shell scripts can act
+                // on it directly instead of scraping the summary text.
+                if let Some(n) = args.count {
+                    if targets.iter().all(|t| t.stats.sent >= n) {
+                        display.restore_cursor();
+                        print_summary(&targets, session_start);
+                        let ok = targets
+                            .iter()
+                            .all(|t| loss_within_threshold(t.stats.lifetime_loss_pct(), args.max_loss));
+                        std::process::exit(if ok { 0 } else { 1 });
+                    }
+                }
             }
         }
     }
 
     Ok(())
+}
+
+/// Pure exit-code predicate for `--count` / `--max-loss`: true if `loss_pct`
+/// is an acceptable outcome. Split out from the exit path so the "any loss
+/// fails by default, <=  max_loss passes" semantics are unit-testable
+/// without spinning up the ping loop.
+fn loss_within_threshold(loss_pct: f64, max_loss_pct: f64) -> bool {
+    loss_pct <= max_loss_pct
 }
 
 /// Applies one tagged ping event to its target's state: outage/recovery
@@ -259,10 +317,22 @@ fn apply_event(
     shared_last_recovery: &mut Instant,
     shared_last_outage_summary: &mut Option<String>,
     cap_notice_printed: &mut bool,
+    recorder: &mut Option<Recorder>,
     tagged: TaggedEvent,
 ) -> std::io::Result<()> {
     let TaggedEvent { idx, event } = tagged;
     let t = &mut targets[idx];
+
+    // --log: one JSONL line per sample, timeout-or-not, before any
+    // outage/state bookkeeping below — the recorder's job is a complete,
+    // unopinionated record, not just the samples that also affect state.
+    if let Some(rec) = recorder.as_mut() {
+        let rtt_ms = match event {
+            PingEvent::Reply(d) => Some(d.as_secs_f64() * 1000.0),
+            PingEvent::Timeout => None,
+        };
+        rec.log_sample(&t.host, rtt_ms)?;
+    }
 
     match event {
         PingEvent::Reply(_) => {
@@ -274,6 +344,13 @@ fn apply_event(
                 // counting from the session start / last real outage.
                 if let Some(started_wall) = t.down_wall_start {
                     let duration = t.down_since.map(|inst| inst.elapsed()).unwrap_or_default();
+                    // Log the outage_end record regardless of the display's
+                    // --max-outages cap — the JSONL log is meant to be the
+                    // complete record for offline analysis, unlike the
+                    // terminal's deliberately-truncated outage-line history.
+                    if let Some(rec) = recorder.as_mut() {
+                        rec.log_outage_end(&t.host, started_wall + duration, duration)?;
+                    }
                     match args.max_outages {
                         Some(cap) if t.outage_count >= cap => {
                             if t.outage_count == cap && cap > 0 && !*cap_notice_printed {
@@ -312,8 +389,12 @@ fn apply_event(
         PingEvent::Timeout => {
             t.consecutive_timeouts += 1;
             if t.consecutive_timeouts == OUTAGE_THRESHOLD {
+                let wall_now = SystemTime::now();
                 t.down_since = Some(Instant::now());
-                t.down_wall_start = Some(SystemTime::now());
+                t.down_wall_start = Some(wall_now);
+                if let Some(rec) = recorder.as_mut() {
+                    rec.log_outage_start(&t.host, wall_now)?;
+                }
             }
         }
     }
@@ -395,5 +476,30 @@ fn print_summary(targets: &[TargetRuntime], session_start: Instant) {
             );
         }
         println!("outages: {}", t.outage_count);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loss_within_threshold_default_zero_fails_any_loss() {
+        assert!(loss_within_threshold(0.0, 0.0));
+        assert!(!loss_within_threshold(0.001, 0.0));
+        assert!(!loss_within_threshold(50.0, 0.0));
+    }
+
+    #[test]
+    fn loss_within_threshold_respects_max_loss() {
+        assert!(loss_within_threshold(20.0, 20.0));
+        assert!(loss_within_threshold(19.9, 20.0));
+        assert!(!loss_within_threshold(20.1, 20.0));
+    }
+
+    #[test]
+    fn loss_within_threshold_full_loss_and_full_allowance() {
+        assert!(loss_within_threshold(100.0, 100.0));
+        assert!(!loss_within_threshold(100.0, 99.9));
     }
 }
