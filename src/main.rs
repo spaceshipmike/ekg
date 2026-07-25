@@ -137,10 +137,12 @@ async fn main() -> std::io::Result<()> {
         .collect();
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<TaggedEvent>(32.max(8 * resolved.len()));
+    let (death_tx, mut death_rx) = tokio::sync::mpsc::channel::<usize>(resolved.len().max(1));
     for (idx, ((_, ip), client)) in resolved.iter().zip(clients.into_iter()).enumerate() {
-        pinger::spawn(client, *ip, interval, idx, tx.clone());
+        pinger::spawn(client, *ip, interval, idx, tx.clone(), death_tx.clone());
     }
     drop(tx);
+    drop(death_tx);
 
     // Shared (session-wide) state used only for the multi-target bottom
     // line and for the cap notice, which prints at most once overall.
@@ -157,73 +159,63 @@ async fn main() -> std::io::Result<()> {
                 print_summary(&targets, session_start);
                 break;
             }
+            maybe_dead = death_rx.recv() => {
+                // See pinger::spawn's doc comment: while this loop is
+                // running, a pinger task ending at all (return or panic)
+                // means that target's monitoring silently stopped. Without
+                // this, the shared channel only closes once *every* target's
+                // task has ended, so one dead target would otherwise leave
+                // its row frozen at stale "healthy" state forever while
+                // survivors keep rendering. Fail loud instead: restore the
+                // terminal (in case the death was a panic that already ran
+                // the panic hook and re-enabled line wrap — restoring again
+                // here is idempotent) and exit non-zero naming the target,
+                // before any further render can run.
+                if let Some(idx) = maybe_dead {
+                    display.restore_cursor();
+                    eprintln!(
+                        "\nekg: monitoring for '{}' stopped unexpectedly — exiting.",
+                        targets[idx].host
+                    );
+                    std::process::exit(1);
+                }
+            }
             maybe_event = rx.recv() => {
-                let tagged = match maybe_event {
+                let first = match maybe_event {
                     Some(e) => e,
                     None => break, // all pinger tasks ended
                 };
-                let TaggedEvent { idx, event } = tagged;
-                let t = &mut targets[idx];
 
-                match event {
-                    PingEvent::Reply(_) => {
-                        if t.consecutive_timeouts >= OUTAGE_THRESHOLD {
-                            // Outage recovery: this reply ends a declared
-                            // outage, so uptime resets from here. A reply
-                            // after only a sub-threshold blip (1-2 timeouts,
-                            // never reached OUTAGE_THRESHOLD) is NOT a
-                            // recovery — uptime keeps counting from the
-                            // session start / last real outage.
-                            if let Some(started_wall) = t.down_wall_start {
-                                let duration = t.down_since
-                                    .map(|inst| inst.elapsed())
-                                    .unwrap_or_default();
-                                match args.max_outages {
-                                    Some(cap) if t.outage_count >= cap => {
-                                        if t.outage_count == cap && cap > 0 && !cap_notice_printed {
-                                            display.emit_notice_line(&format!(
-                                                "… outage log capped at {cap}; later outages still counted in the summary"
-                                            ))?;
-                                            cap_notice_printed = true;
-                                        }
-                                    }
-                                    _ => {
-                                        let host_prefix = if multi { Some(t.host.as_str()) } else { None };
-                                        display.emit_outage_line(host_prefix, started_wall, duration)?;
-                                    }
-                                }
-                                t.last_outage_summary = Some(format!(
-                                    "last outage: {} ({})",
-                                    display::local_hms(started_wall),
-                                    fmt_short(duration)
-                                ));
-                                shared_last_outage_summary = Some(format!(
-                                    "last outage: {} {} ({})",
-                                    display::local_hms(started_wall),
-                                    t.host,
-                                    fmt_short(duration)
-                                ));
-                                t.outage_count += 1;
-                            }
-                            let now = Instant::now();
-                            t.last_recovery = now;
-                            shared_last_recovery = now;
-                        }
-                        t.consecutive_timeouts = 0;
-                        t.down_since = None;
-                        t.down_wall_start = None;
-                    }
-                    PingEvent::Timeout => {
-                        t.consecutive_timeouts += 1;
-                        if t.consecutive_timeouts == OUTAGE_THRESHOLD {
-                            t.down_since = Some(Instant::now());
-                            t.down_wall_start = Some(SystemTime::now());
-                        }
-                    }
+                apply_event(
+                    &mut targets,
+                    &mut display,
+                    &args,
+                    multi,
+                    &mut shared_last_recovery,
+                    &mut shared_last_outage_summary,
+                    &mut cap_notice_printed,
+                    first,
+                )?;
+
+                // Drain any events that are already waiting so a backlog
+                // triggers one redraw per batch instead of one full
+                // clear+redraw per event (O(targets) work per event would
+                // otherwise become O(targets^2) per interval tick when
+                // every target's event lands close together). Outage
+                // bookkeeping/emission still happens per event, in order —
+                // only the panel redraw below is coalesced.
+                while let Ok(tagged) = rx.try_recv() {
+                    apply_event(
+                        &mut targets,
+                        &mut display,
+                        &args,
+                        multi,
+                        &mut shared_last_recovery,
+                        &mut shared_last_outage_summary,
+                        &mut cap_notice_printed,
+                        tagged,
+                    )?;
                 }
-
-                let sample: Sample = event.into();
-                targets[idx].stats.record(sample);
 
                 if multi {
                     render_multi_panel(&mut display, &targets, session_start, shared_last_recovery, shared_last_outage_summary.as_deref())?;
@@ -248,6 +240,86 @@ async fn main() -> std::io::Result<()> {
             }
         }
     }
+
+    Ok(())
+}
+
+/// Applies one tagged ping event to its target's state: outage/recovery
+/// bookkeeping (including any permanent outage/notice line emission) and
+/// the rolling `Stats` record. Split out from the render step so a burst of
+/// pending events can all be applied before a single coalesced redraw
+/// (non-blocking's #3) — every event must still be applied so no outage
+/// transition is ever skipped, only the panel redraw is batched.
+#[allow(clippy::too_many_arguments)]
+fn apply_event(
+    targets: &mut [TargetRuntime],
+    display: &mut Display,
+    args: &Args,
+    multi: bool,
+    shared_last_recovery: &mut Instant,
+    shared_last_outage_summary: &mut Option<String>,
+    cap_notice_printed: &mut bool,
+    tagged: TaggedEvent,
+) -> std::io::Result<()> {
+    let TaggedEvent { idx, event } = tagged;
+    let t = &mut targets[idx];
+
+    match event {
+        PingEvent::Reply(_) => {
+            if t.consecutive_timeouts >= OUTAGE_THRESHOLD {
+                // Outage recovery: this reply ends a declared outage, so
+                // uptime resets from here. A reply after only a
+                // sub-threshold blip (1-2 timeouts, never reached
+                // OUTAGE_THRESHOLD) is NOT a recovery — uptime keeps
+                // counting from the session start / last real outage.
+                if let Some(started_wall) = t.down_wall_start {
+                    let duration = t.down_since.map(|inst| inst.elapsed()).unwrap_or_default();
+                    match args.max_outages {
+                        Some(cap) if t.outage_count >= cap => {
+                            if t.outage_count == cap && cap > 0 && !*cap_notice_printed {
+                                display.emit_notice_line(&format!(
+                                    "… outage log capped at {cap}; later outages still counted in the summary"
+                                ))?;
+                                *cap_notice_printed = true;
+                            }
+                        }
+                        _ => {
+                            let host_prefix = if multi { Some(t.host.as_str()) } else { None };
+                            display.emit_outage_line(host_prefix, started_wall, duration)?;
+                        }
+                    }
+                    t.last_outage_summary = Some(format!(
+                        "last outage: {} ({})",
+                        display::local_hms(started_wall),
+                        fmt_short(duration)
+                    ));
+                    *shared_last_outage_summary = Some(format!(
+                        "last outage: {} {} ({})",
+                        display::local_hms(started_wall),
+                        t.host,
+                        fmt_short(duration)
+                    ));
+                    t.outage_count += 1;
+                }
+                let now = Instant::now();
+                t.last_recovery = now;
+                *shared_last_recovery = now;
+            }
+            t.consecutive_timeouts = 0;
+            t.down_since = None;
+            t.down_wall_start = None;
+        }
+        PingEvent::Timeout => {
+            t.consecutive_timeouts += 1;
+            if t.consecutive_timeouts == OUTAGE_THRESHOLD {
+                t.down_since = Some(Instant::now());
+                t.down_wall_start = Some(SystemTime::now());
+            }
+        }
+    }
+
+    let sample: Sample = event.into();
+    targets[idx].stats.record(sample);
 
     Ok(())
 }
