@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime};
 use clap::Parser;
 
 use display::{Display, MultiTargetRow, OUTAGE_THRESHOLD};
+use hooks::Hooks;
 use pinger::{PingEvent, TaggedEvent};
 use recorder::Recorder;
 use stats::{Sample, Stats};
@@ -65,18 +66,23 @@ struct Args {
     log: Option<PathBuf>,
 
     /// Run this command (via `$SHELL -c`, falling back to `sh -c`) when an
-    /// outage is declared. Spawned detached — it never blocks the ping loop
-    /// even if the command hangs — with its stdin/stdout/stderr discarded so
-    /// its output can't corrupt the panel. Gets EKG_HOST and
+    /// outage is declared. Spawned detached in its own process group — it
+    /// never blocks the ping loop even if the command hangs, its
+    /// stdin/stdout/stderr are discarded so its output can't corrupt the
+    /// panel, and it survives a Ctrl-C to ekg instead of dying with it.
+    /// Killed if still running after 30s. If a previous --on-outage
+    /// invocation is still running when a new outage is declared, the new
+    /// one is skipped (at most one in flight at a time). Gets EKG_HOST and
     /// EKG_OUTAGE_START (ms since the Unix epoch) in its environment.
     /// Useful for push notifications (ntfy, Pushover), external logging, or
     /// automations like power-cycling a router.
     #[arg(long)]
     on_outage: Option<String>,
 
-    /// Run this command (same shell/detach/env semantics as --on-outage)
-    /// when an outage recovers. Gets EKG_HOST, EKG_OUTAGE_START, and
-    /// EKG_OUTAGE_SECS (whole seconds the outage lasted).
+    /// Run this command (same shell/detach/timeout/single-flight semantics
+    /// as --on-outage, tracked independently) when an outage recovers. Gets
+    /// EKG_HOST, EKG_OUTAGE_START, and EKG_OUTAGE_SECS (whole seconds the
+    /// outage lasted).
     #[arg(long)]
     on_recovery: Option<String>,
 }
@@ -181,6 +187,12 @@ async fn main() -> std::io::Result<()> {
         None => None,
     };
 
+    // --on-outage/--on-recovery single-flight state: one `Hooks` for the
+    // whole session, shared across every target (see hooks.rs's doc
+    // comment for why "single-flight, not per-target" is the chosen
+    // granularity).
+    let hooks = Hooks::new();
+
     let interval = Duration::from_secs_f64(args.interval.max(0.001));
     let multi = resolved.len() > 1;
 
@@ -275,6 +287,7 @@ async fn main() -> std::io::Result<()> {
                     &mut shared_last_outage_summary,
                     &mut cap_notice_printed,
                     &mut recorder,
+                    &hooks,
                     first,
                 )?;
 
@@ -295,6 +308,7 @@ async fn main() -> std::io::Result<()> {
                         &mut shared_last_outage_summary,
                         &mut cap_notice_printed,
                         &mut recorder,
+                        &hooks,
                         tagged,
                     )?;
                 }
@@ -387,6 +401,7 @@ fn apply_event(
     shared_last_outage_summary: &mut Option<String>,
     cap_notice_printed: &mut bool,
     recorder: &mut Option<Recorder>,
+    hooks: &Hooks,
     tagged: TaggedEvent,
 ) -> std::io::Result<()> {
     let TaggedEvent { idx, event } = tagged;
@@ -426,7 +441,7 @@ fn apply_event(
                     // ones that also got a terminal line.
                     if let Some(cmd) = args.on_recovery.as_deref() {
                         let env = hooks::recovery_env(&t.host, started_wall, duration);
-                        hooks::spawn_hook(cmd, &env);
+                        hooks.fire_recovery(cmd, &env);
                     }
                     match args.max_outages {
                         Some(cap) if t.outage_count >= cap => {
@@ -474,7 +489,7 @@ fn apply_event(
                 }
                 if let Some(cmd) = args.on_outage.as_deref() {
                     let env = hooks::outage_env(&t.host, wall_now);
-                    hooks::spawn_hook(cmd, &env);
+                    hooks.fire_outage(cmd, &env);
                 }
             }
         }

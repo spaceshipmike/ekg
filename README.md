@@ -72,8 +72,17 @@ ekg --on-outage 'ntfy publish home-net "ekg: $EKG_HOST is down"' \
 
 Each command runs via `$SHELL -c` (falling back to `sh -c` if `$SHELL` is unset) — the same shell you'd get
 in an interactive terminal, so pipes, quoting, and env var expansion all work as expected. It's spawned
-**detached**: stdin/stdout/stderr are discarded and the ping loop never waits on it, so a slow or hung command
-(a flaky notification API, a router that takes a while to reboot) can't stall monitoring or corrupt the panel.
+**detached, in its own process group**: stdin/stdout/stderr are discarded, the ping loop never waits on it, and
+it doesn't die alongside ekg on Ctrl-C or a terminal hangup — a slow or hung command (a flaky notification API,
+a router that takes a while to reboot) can't stall monitoring or corrupt the panel, and a power-cycle command
+gets to actually finish even if you Ctrl-C out of ekg right after triggering it.
+
+Two safety bounds, so a flapping link can't pile up unbounded background work:
+
+- **30s timeout** — a hook still running after 30 seconds is killed.
+- **Single-flight per hook kind** — if the previous `--on-outage` (or `--on-recovery`) invocation hasn't
+  finished yet, a new one is skipped rather than stacked. `--on-outage` and `--on-recovery` are tracked
+  independently, so one kind being in flight never blocks the other.
 
 Env vars passed to the command:
 
