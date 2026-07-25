@@ -149,7 +149,6 @@ impl Stats {
             })
             .collect()
     }
-
 }
 
 #[cfg(test)]

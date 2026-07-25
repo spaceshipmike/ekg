@@ -105,7 +105,10 @@ impl Display {
     /// line count, so cursor-up repositioning drifts and the panel smears
     /// duplicate rows down the screen in narrow terminals.
     pub fn hide_cursor(&mut self) -> std::io::Result<()> {
-        stdout().queue(cursor::Hide)?.queue(DisableLineWrap)?.flush()?;
+        stdout()
+            .queue(cursor::Hide)?
+            .queue(DisableLineWrap)?
+            .flush()?;
         self.hidden_cursor = true;
         Ok(())
     }
@@ -139,7 +142,11 @@ impl Display {
 
     /// Prints a permanent outage summary line that scrolls into history,
     /// above where the panel will resume.
-    pub fn emit_outage_line(&mut self, start_wall: std::time::SystemTime, duration: Duration) -> std::io::Result<()> {
+    pub fn emit_outage_line(
+        &mut self,
+        start_wall: std::time::SystemTime,
+        duration: Duration,
+    ) -> std::io::Result<()> {
         self.clear_panel()?;
         let start_local = local_hms(start_wall);
         let end_local = local_hms(start_wall + duration);
