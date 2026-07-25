@@ -373,4 +373,14 @@ mod tests {
         assert_eq!(s.min_rtt.unwrap(), ms(5));
         assert_eq!(s.max_rtt.unwrap(), ms(200));
     }
+
+    #[test]
+    fn spark_bucket_boundaries_table() {
+        // Every threshold: just-below stays in the lower level, exact value
+        // lands in the next level (consistent `<` comparison direction).
+        for (i, &t) in SPARK_BUCKET_MS.iter().enumerate() {
+            assert_eq!(spark_bucket_level(t - 0.001), i as u8, "below {t}ms");
+            assert_eq!(spark_bucket_level(t), i as u8 + 1, "exact {t}ms");
+        }
+    }
 }
