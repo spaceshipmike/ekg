@@ -130,7 +130,7 @@ ekg --completions fish > /path/to/completions/ekg.fish
 ekg --manpage           > /path/to/man/man1/ekg.1
 ```
 
-These are packaging plumbing (`--help` doesn't list them) — the Homebrew formula generates and installs both at install time, so a `brew install` gets working completions and `man ekg` for free.
+These are packaging plumbing (`--help` doesn't list them). The Homebrew formula will generate and install both once it picks up a release containing these flags; until then, generate them manually with the commands above.
 
 ### Linux note
 

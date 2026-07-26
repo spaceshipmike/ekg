@@ -10,7 +10,7 @@
 
 **Decision.** The `--log` recorder serializes JSONL by hand (`src/recorder.rs::escape_json`) instead of adding serde.
 
-**Why.** The README promises "fast and tiny — four dependencies"; the recorder writes three fixed shapes with one string field. A serialization framework buys nothing here and costs compile time, binary size, and the marketing claim. (Issue #3 / PR #10.)
+**Why.** The README promises "fast and tiny" with a counted dependency list (four at the time; six since `clap_complete`/`clap_mangen` landed for completions and the man page); the recorder writes three fixed shapes with one string field. A serialization framework buys nothing here and costs compile time, binary size, and the marketing claim. (Issue #3 / PR #10.)
 
 **Revisit trigger.** A third structured-output surface (e.g. a `--json` status output or config file) that makes hand-escaping error-prone.
 
