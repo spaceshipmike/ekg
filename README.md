@@ -2,6 +2,8 @@
 
 A compact, in-place ping monitor. The machine that goes *ping* — without the wall of scrolling text.
 
+![ekg demo: a live ping panel, then an outage being declared against an unreachable host](docs/demo.gif)
+
 ```
 ● 1.1.1.1   12ms   ▁▂▂▃▂▁▂▂▃▂
   avg 14ms · jitter 2ms · loss 0% · up 2h14m
