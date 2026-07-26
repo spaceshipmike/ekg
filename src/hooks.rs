@@ -396,6 +396,27 @@ mod tests {
     /// real reason.
     const TEST_POLL_BUDGET: Duration = Duration::from_secs(30);
 
+    /// Internal `HOOK_WRAPPER` watchdog timeout used by the two tests that
+    /// need the timeout to actually fire (as opposed to `HOOK_TIMEOUT`,
+    /// production's real 30s value, used everywhere the timeout must *not*
+    /// fire during the test). Deliberately more than the 1s these tests
+    /// used to hardcode: `spawn_hook_with_timeout` always runs the test
+    /// command via the *live* `$SHELL -c`, and a non-interactive shell
+    /// startup is not guaranteed to be fast — a `.zshenv`/`.bashrc` doing
+    /// real work (oh-my-zsh, direnv, nvm/rbenv hooks, secrets bootstrapping
+    /// via a credential manager CLI) can easily take 1-3s even
+    /// non-interactively, independent of anything ekg does. A 1s internal
+    /// timeout races that startup cost and can fire before the shell even
+    /// reaches the test's command, which one worker machine's
+    /// multi-second, four-`op-read` `.zshenv` demonstrated concretely: the
+    /// group-kill fired mid-startup, so the grandchild's pid was never
+    /// written and the test failed for an environment reason that looks
+    /// identical to a real group-kill regression. 5s keeps both tests fast
+    /// relative to `TEST_POLL_BUDGET` while giving realistic shell startup
+    /// costs comfortable headroom; it does not change what's being
+    /// verified (the kill firing at all), only when it's allowed to fire.
+    const GROUP_KILL_TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
     /// Polls `cond` until it's true or `budget` elapses, returning whether
     /// it succeeded. Used for every timing-sensitive assertion below in
     /// place of "sleep a fixed amount, then assert" — this whole suite
@@ -571,6 +592,9 @@ mod tests {
     /// fractional-second argument; whole seconds are unambiguous
     /// everywhere. See the module's test-hardening commit for the CI
     /// flakiness this replaced.
+    ///
+    /// [`GROUP_KILL_TEST_TIMEOUT`]'s doc comment covers why this is 5s, not
+    /// 1s.
     #[cfg(unix)]
     #[tokio::test]
     async fn spawn_hook_kills_and_reaps_after_timeout() {
@@ -580,7 +604,7 @@ mod tests {
             "sleep 300", // far longer than TEST_POLL_BUDGET could tolerate
             &[],
             Arc::clone(&running),
-            Duration::from_secs(1),
+            GROUP_KILL_TEST_TIMEOUT,
         );
         let cleared = poll_until(TEST_POLL_BUDGET, || !running.load(Ordering::SeqCst)).await;
         assert!(cleared, "timeout kill never cleared the running flag");
@@ -616,7 +640,8 @@ mod tests {
     /// test can check it directly, independent of the wrapper process's
     /// fate. `#[cfg(unix)]`: relies on POSIX process groups/signals and
     /// `sh` job-control syntax, matching ekg's own macOS/Linux-only
-    /// support (see README/CI).
+    /// support (see README/CI). [`GROUP_KILL_TEST_TIMEOUT`]'s doc comment
+    /// covers why the internal timeout is 5s, not 1s.
     #[cfg(unix)]
     #[tokio::test]
     async fn spawn_hook_kills_whole_group_including_grandchildren() {
@@ -630,7 +655,7 @@ mod tests {
 
         let running = Arc::new(AtomicBool::new(true));
         let cmd = format!("sleep 300 & echo $! > {}; wait", path.display());
-        spawn_hook_with_timeout(&cmd, &[], Arc::clone(&running), Duration::from_secs(1));
+        spawn_hook_with_timeout(&cmd, &[], Arc::clone(&running), GROUP_KILL_TEST_TIMEOUT);
 
         let recorded = poll_until(TEST_POLL_BUDGET, || {
             std::fs::read_to_string(&path)
