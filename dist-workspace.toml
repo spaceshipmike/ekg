@@ -21,3 +21,9 @@ install-updater = false
 tap = "spaceshipmike/homebrew-tap"
 # Publish jobs to run in CI
 publish-jobs = ["homebrew"]
+# release.yml is hand-hardened (tag values passed via quoted env vars instead
+# of being spliced into run: scripts, all actions pinned to full commit SHAs)
+# on top of what `dist generate` would produce. Without this, `dist
+# plan`/`dist host` fails its "is the workflow up to date" check on every
+# push. See INVARIANTS.md for the contract this hardening must preserve.
+allow-dirty = ["ci"]
