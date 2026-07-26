@@ -17,7 +17,7 @@ cross-cutting edge without looking like they do.
 | README | `README.md` | change any user-visible behavior, flag, schema, or contract | re-read the touched section against the running binary |
 | CI workflow | `.github/workflows/ci.yml` | change toolchain, test invocation, or platform matrix | both checks green; branch protection contexts still match job names |
 | Release workflow | `.github/workflows/release.yml` | change the release/publish pipeline (cargo-dist output or the hand-hardening on top of it) | reapply tag-as-quoted-env-var + full-SHA action pinning after any regen; `dist-workspace.toml` `allow-dirty = ["ci"]` still present; actionlint clean |
-| Homebrew tap | `spaceshipmike/homebrew-tap` (external repo) | a tagged release runs `publish-homebrew-formula` | formula in the tap repo matches the version/URL of the tag just released |
+| Homebrew tap | `spaceshipmike/homebrew-tap` (external repo, hand-maintained) | a tagged release ships new user-visible behavior, a flag, or completions/man-page support the formula should reflect | formula in the tap repo is updated by hand and matches the version/URL of a real GitHub Release |
 
 ## Cross-cutting edges (the silent ones)
 
