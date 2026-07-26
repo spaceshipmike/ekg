@@ -5,6 +5,7 @@ edition = "2021"
 description = "Compact in-place ping monitor that updates a status panel instead of scrolling"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/spaceshipmike/ekg"
+homepage = "https://github.com/spaceshipmike/ekg"
 readme = "README.md"
 keywords = ["ping", "network", "monitoring", "latency", "cli"]
 categories = ["command-line-utilities", "network-programming"]
@@ -20,3 +21,8 @@ clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 clap_complete = "4"
 clap_mangen = "0.3"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

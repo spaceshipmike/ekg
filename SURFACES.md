@@ -15,7 +15,9 @@ cross-cutting edge without looking like they do.
 | Outage hooks | `src/hooks.rs` | touch spawn/timeout/kill/env behavior or the shell wrapper | `hooks::tests` (incl. dash tests); 10 consecutive full-suite runs |
 | Ping engine | `src/pinger.rs` | change interval, count bounding, socket, or supervisor behavior | `pinger::tests`; live run against a reachable + an unreachable host |
 | README | `README.md` | change any user-visible behavior, flag, schema, or contract | re-read the touched section against the running binary |
-| CI workflow | `.github/workflows/` | change toolchain, test invocation, or platform matrix | both checks green; branch protection contexts still match job names |
+| CI workflow | `.github/workflows/ci.yml` | change toolchain, test invocation, or platform matrix | both checks green; branch protection contexts still match job names |
+| Release workflow | `.github/workflows/release.yml` | change the release/publish pipeline (cargo-dist output or the hand-hardening on top of it) | reapply tag-as-quoted-env-var + full-SHA action pinning after any regen; `dist-workspace.toml` `allow-dirty = ["ci"]` still present; actionlint clean |
+| Homebrew tap | `spaceshipmike/homebrew-tap` (external repo, hand-maintained) | a tagged release ships new user-visible behavior, a flag, or completions/man-page support the formula should reflect | formula in the tap repo is updated by hand and matches the version/URL of a real GitHub Release |
 
 ## Cross-cutting edges (the silent ones)
 
@@ -25,6 +27,9 @@ cross-cutting edge without looking like they do.
 - The hook shell wrapper (`HOOK_WRAPPER` in `src/hooks.rs`) ↔ Linux dash — the wrapper is interpreted by `/bin/sh`, which is bash on macOS but dash on Debian/Ubuntu. Any edit must keep the dash-exercising tests passing; bash-only syntax will pass everywhere except Linux.
 - CI job names (`build + test (macos-latest)` / `build + test (ubuntu-latest)`) ↔ branch-protection required contexts — renaming a workflow job silently makes `main` unmergeable (or unprotected) until the protection rule is updated to match.
 - README counted-dependency claim ("six dependencies") ↔ `Cargo.toml` `[dependencies]` — a new crate invalidates marketing copy that reviewers and users quote.
+- `dist-workspace.toml` ↔ `.github/workflows/release.yml` — cargo-dist treats `release.yml` as generated output of `dist-workspace.toml`; `dist plan`/`dist host` fail their "workflow is up to date" check if the two drift without `allow-dirty = ["ci"]` set. Any edit to either file needs the other checked: a `dist-workspace.toml` config change should be followed by a regen (`dist generate`) with the hand-hardening reapplied; a hand edit to `release.yml` needs `allow-dirty` to stay set or it must exactly match fresh `dist generate` output.
+- Git tag ↔ `Cargo.toml` `[package].version` — `release.yml` only fires on tags matching `**[0-9]+.[0-9]+.[0-9]+*`, and cargo-dist's `plan`/`host` steps reject a tag whose version doesn't match `Cargo.toml`. Bumping the version without an intent to tag-and-release is safe; tagging with a stale `Cargo.toml` version is not.
+- Release pipeline output ↔ Homebrew tap formula in `spaceshipmike/homebrew-tap` — the pipeline does **not** publish to the tap (Homebrew publishing is disabled in `dist-workspace.toml`: the stock cargo-dist formula would omit completions/the man page, and no `HOMEBREW_TAP_TOKEN` secret exists). The tap formula is hand-maintained and builds from source; a version bump there must be done manually and can drift from the latest GitHub Release until someone updates it.
 
 ## The sweep
 

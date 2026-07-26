@@ -1,0 +1,29 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+# Homebrew is deliberately excluded: the stock cargo-dist formula would omit
+# completions/the man page, and there is no HOMEBREW_TAP_TOKEN secret in
+# this repo. The tap (spaceshipmike/homebrew-tap) stays hand-maintained,
+# building from source. See INVARIANTS.md / SURFACES.md.
+installers = ["shell"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Where to host releases
+hosting = "github"
+# Whether to install an updater program
+install-updater = false
+# release.yml is hand-hardened (tag values passed via quoted env vars instead
+# of being spliced into run: scripts, all actions pinned to full commit SHAs)
+# on top of what `dist generate` would produce. Without this, `dist
+# plan`/`dist host` fails its "is the workflow up to date" check on every
+# push. See INVARIANTS.md for the contract this hardening must preserve.
+allow-dirty = ["ci"]
