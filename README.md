@@ -113,10 +113,11 @@ first — an `--on-outage` hook never sees a stale `EKG_OUTAGE_SECS` left over f
 ## Install
 
 ```bash
-cargo install --path .
+brew install spaceshipmike/tap/ekg   # Homebrew (macOS or Linux)
+cargo install ekg                    # crates.io
 ```
 
-Prebuilt binaries, Homebrew, and crates.io coming with the first tagged release.
+Prebuilt binaries and a curl installer are coming; both routes above build from source (the Homebrew route needs no Rust toolchain of your own — brew provides it at build time).
 
 ### Linux note
 
