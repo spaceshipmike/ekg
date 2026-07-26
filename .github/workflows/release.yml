@@ -14,13 +14,13 @@
 # title/body based on your changelogs.
 
 name: Release
-# Workflow-wide default is read-only. Only jobs that actually create/upload
-# a GitHub Release (plan's `dist host --steps=create` on a tag push, and
-# host's `dist host --steps=upload --steps=release` + `gh release create`)
-# escalate to contents: write via a job-level permissions block, which
-# overrides this default. In particular the pull_request-triggered `plan`
-# run (which only executes `dist plan`, a read-only operation) never gets
-# write access.
+# Workflow-wide default is read-only. Only the `host` job — the one that
+# actually creates and uploads the GitHub Release (`dist host
+# --steps=upload --steps=release` + `gh release create`) — escalates to
+# contents: write via a job-level permissions block. `plan` runs read-only
+# on every trigger: with GitHub-only hosting, `dist host --steps=create`
+# computes the hosting plan and validates the tag against Cargo.toml
+# without any repository write.
 permissions:
   "contents": "read"
 
@@ -55,12 +55,14 @@ jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
     runs-on: "ubuntu-22.04"
-    # Needs contents:write for the tag-push path, where `dist host
-    # --steps=create` creates the draft GitHub Release via GH_TOKEN. The
-    # pull_request path only runs `dist plan` (read-only) but the job-level
-    # grant is still scoped no wider than this job.
+    # Read-only on every trigger (pull_request and tag push alike): `dist
+    # plan` and — with GitHub-only hosting — `dist host --steps=create` are
+    # both read-only operations; the GitHub Release itself is created later
+    # by the write-scoped `host` job. Keeping this job read-only means the
+    # third-party cargo-dist installer it downloads never runs next to a
+    # write-capable token.
     permissions:
-      "contents": "write"
+      "contents": "read"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
       tag: ${{ !github.event.pull_request && github.ref_name || '' }}
