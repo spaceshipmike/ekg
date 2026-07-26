@@ -153,7 +153,7 @@ jobs:
         run: |
           if ! command -v cargo > /dev/null 2>&1; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           fi
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
@@ -186,9 +186,11 @@ jobs:
         shell: bash
         run: |
           # Parse out what we just built and upload it to scratch storage
-          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
-          dist print-upload-files-from-manifest --manifest dist-manifest.json >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          {
+            echo "paths<<EOF"
+            dist print-upload-files-from-manifest --manifest dist-manifest.json
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
       - name: "Upload artifacts"
@@ -242,9 +244,11 @@ jobs:
           echo "dist ran successfully"
 
           # Parse out what we just built and upload it to scratch storage
-          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
-          jq --raw-output ".upload_files[]" dist-manifest.json >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          {
+            echo "paths<<EOF"
+            jq --raw-output ".upload_files[]" dist-manifest.json
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
       - name: "Upload artifacts"
@@ -262,13 +266,14 @@ jobs:
       - build-global-artifacts
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
     if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
-    # Needs contents:write: uploads release assets via `dist host
-    # --steps=upload --steps=release` and creates the GitHub Release via
-    # `gh release create` below.
+    # Needs contents:write for the `gh release create` step below. The
+    # write-capable GH_TOKEN is scoped to that single step (not job-wide),
+    # so the cached third-party `dist` binary executed in the `host` step
+    # never runs with a write token — with GitHub-only hosting, `dist host`
+    # performs no GitHub uploads itself.
     permissions:
       "contents": "write"
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # Passed as an env var and only ever referenced as a quoted shell
       # variable below, never spliced into run: text.
       TAG: ${{ needs.plan.outputs.tag }}
@@ -325,6 +330,10 @@ jobs:
           rm -f artifacts/*-dist-manifest.json
       - name: Create GitHub Release
         env:
+          # The write-capable token lives only in this step's environment;
+          # every other step in this job (including the third-party `dist`
+          # binary) runs without it.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
           ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
@@ -332,9 +341,15 @@ jobs:
           RELEASE_TAG: ${{ needs.plan.outputs.tag }}
         run: |
           # Write and read notes from a file to avoid quoting breaking things
-          echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
+          echo "$ANNOUNCEMENT_BODY" > "$RUNNER_TEMP/notes.txt"
 
-          gh release create "$RELEASE_TAG" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+          # Build the optional --prerelease flag as an array so the
+          # expansion is exact: no flag when empty, never an empty argument.
+          PRERELEASE_ARGS=()
+          if [ -n "$PRERELEASE_FLAG" ]; then
+            PRERELEASE_ARGS=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" --target "$RELEASE_COMMIT" "${PRERELEASE_ARGS[@]}" --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
   # Homebrew publishing (publish-homebrew-formula) is intentionally omitted:
   # the stock cargo-dist formula would omit completions/the man page, and no
