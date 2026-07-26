@@ -8,7 +8,7 @@ use std::net::{IpAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 
 use display::{Display, MultiTargetRow, OUTAGE_THRESHOLD};
 use hooks::Hooks;
@@ -88,6 +88,19 @@ struct Args {
     /// EKG_OUTAGE_SECS (whole seconds the outage lasted).
     #[arg(long)]
     on_recovery: Option<String>,
+
+    /// Print a shell completion script for the given shell to stdout and
+    /// exit. Hidden from --help: this is packaging plumbing (the Homebrew
+    /// formula and shell installer generate completions at install time by
+    /// invoking this), not something an interactive user reaches for.
+    #[arg(long, hide = true, value_enum)]
+    completions: Option<clap_complete::Shell>,
+
+    /// Print a roff(7) man page generated from this CLI definition to
+    /// stdout and exit. Hidden for the same packaging reason as
+    /// --completions.
+    #[arg(long, hide = true)]
+    manpage: bool,
 }
 
 /// Resolves the host argument to an IP address, accepting either a literal
@@ -143,6 +156,20 @@ impl TargetRuntime {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::io::Result<()> {
     let args = Args::parse();
+
+    // --completions / --manpage: pure packaging plumbing, handled before
+    // anything else touches the network or the terminal. Both print a
+    // generated artifact to stdout and exit immediately — same shape as
+    // the --count 0 early-out below, one step earlier.
+    if let Some(shell) = args.completions {
+        clap_complete::generate(shell, &mut Args::command(), "ekg", &mut std::io::stdout());
+        return Ok(());
+    }
+    if args.manpage {
+        let man = clap_mangen::Man::new(Args::command());
+        man.render(&mut std::io::stdout())?;
+        return Ok(());
+    }
 
     // --count 0: nothing to send, so there's nothing to wait on either.
     // Handled before any host resolution, client/socket creation, or
@@ -618,6 +645,45 @@ mod tests {
     fn parse_max_loss_rejects_garbage() {
         assert!(parse_max_loss("not-a-number").is_err());
         assert!(parse_max_loss("").is_err());
+    }
+
+    /// clap's own self-consistency check (conflicting arg names, invalid
+    /// value parsers, etc.) — cheap insurance against a hand-written
+    /// `#[arg(...)]` attribute that's individually valid Rust but produces
+    /// a broken `Command` at the clap level, which `cargo build` alone
+    /// wouldn't catch.
+    #[test]
+    fn args_command_is_valid() {
+        Args::command().debug_assert();
+    }
+
+    #[test]
+    fn completions_flag_parses_for_every_supported_shell() {
+        for shell in ["bash", "zsh", "fish"] {
+            let args = Args::try_parse_from(["ekg", "--completions", shell])
+                .unwrap_or_else(|e| panic!("--completions {shell} should parse: {e}"));
+            assert_eq!(
+                args.completions,
+                Some(shell.parse().unwrap()),
+                "--completions {shell}"
+            );
+        }
+    }
+
+    #[test]
+    fn manpage_flag_parses() {
+        let args = Args::try_parse_from(["ekg", "--manpage"]).unwrap();
+        assert!(args.manpage);
+    }
+
+    /// --completions/--manpage are packaging plumbing, not user-facing
+    /// flags — pins them out of --help so they don't show up next to
+    /// --on-outage/--on-recovery and confuse an interactive user.
+    #[test]
+    fn completions_and_manpage_are_hidden_from_help() {
+        let help = Args::command().render_long_help().to_string();
+        assert!(!help.contains("--completions"), "{help}");
+        assert!(!help.contains("--manpage"), "{help}");
     }
 
     #[test]

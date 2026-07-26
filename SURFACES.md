@@ -24,7 +24,7 @@ cross-cutting edge without looking like they do.
 - `src/display.rs` `Drop` ↔ every `std::process::exit` call site in `src/main.rs` — `Drop` never runs under `process::exit`, so each exit site needs its own `restore_cursor()`. Adding an exit path without one corrupts the terminal on that path only (invisible in tests).
 - The hook shell wrapper (`HOOK_WRAPPER` in `src/hooks.rs`) ↔ Linux dash — the wrapper is interpreted by `/bin/sh`, which is bash on macOS but dash on Debian/Ubuntu. Any edit must keep the dash-exercising tests passing; bash-only syntax will pass everywhere except Linux.
 - CI job names (`build + test (macos-latest)` / `build + test (ubuntu-latest)`) ↔ branch-protection required contexts — renaming a workflow job silently makes `main` unmergeable (or unprotected) until the protection rule is updated to match.
-- README "four dependencies" claim ↔ `Cargo.toml` `[dependencies]` — a new crate invalidates marketing copy that reviewers and users quote.
+- README counted-dependency claim ("six dependencies") ↔ `Cargo.toml` `[dependencies]` — a new crate invalidates marketing copy that reviewers and users quote.
 
 ## The sweep
 

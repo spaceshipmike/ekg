@@ -25,7 +25,7 @@ ekg pings a host and renders a small status panel that updates **in place** — 
 - **Outage hooks** — `--on-outage` / `--on-recovery` run a shell command when the connection drops/comes back, for push notifications or automations
 - **Scripted runs** — `-c N` sends N pings and exits with a loss-based status code, no interactive session needed
 - **No sudo** — uses unprivileged ICMP datagram sockets
-- **Fast and tiny** — single static binary, four dependencies
+- **Fast and tiny** — single static binary, six dependencies
 
 ## Usage
 
@@ -118,6 +118,19 @@ cargo install ekg                    # crates.io
 ```
 
 Prebuilt binaries and a curl installer are coming; both routes above build from source (the Homebrew route needs no Rust toolchain of your own — brew provides it at build time).
+
+### Completions & man page
+
+`ekg` can generate its own shell completions and man page — there's nothing to download separately:
+
+```bash
+ekg --completions bash > /path/to/completions/ekg.bash
+ekg --completions zsh  > /path/to/completions/_ekg
+ekg --completions fish > /path/to/completions/ekg.fish
+ekg --manpage           > /path/to/man/man1/ekg.1
+```
+
+These are packaging plumbing (`--help` doesn't list them). The Homebrew formula will generate and install both once it picks up a release containing these flags; until then, generate them manually with the commands above.
 
 ### Linux note
 

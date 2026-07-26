@@ -55,5 +55,5 @@
 
 ## Open tensions (NOT invariants — tracked drift to resolve)
 
-- The README's "four dependencies" line is load-bearing prose — recount it whenever Cargo.toml changes (feature additions to existing crates are fine; new crates need a reason and a README edit).
+- The README's counted-dependency line ("six dependencies" since completions/man-page generation added `clap_complete` + `clap_mangen`) is load-bearing prose — recount it whenever Cargo.toml changes (feature additions to existing crates are fine; new crates need a reason and a README edit).
 - Issue #5 (release pipeline) will add version-bearing files (Homebrew formula, install script); revisit the "version lives in Cargo.toml only" entry when it lands.
