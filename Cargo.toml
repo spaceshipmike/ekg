@@ -5,6 +5,9 @@ edition = "2021"
 description = "Compact in-place ping monitor that updates a status panel instead of scrolling"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/spaceshipmike/ekg"
+readme = "README.md"
+keywords = ["ping", "network", "monitoring", "latency", "cli"]
+categories = ["command-line-utilities", "network-programming"]
 
 [[bin]]
 name = "ekg"
