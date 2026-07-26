@@ -14,13 +14,14 @@
 # title/body based on your changelogs.
 
 name: Release
-# Workflow-wide default is read-only. Only the `host` job — the one that
-# actually creates and uploads the GitHub Release (`dist host
-# --steps=upload --steps=release` + `gh release create`) — escalates to
-# contents: write via a job-level permissions block. `plan` runs read-only
-# on every trigger: with GitHub-only hosting, `dist host --steps=create`
-# computes the hosting plan and validates the tag against Cargo.toml
-# without any repository write.
+# Workflow-wide default is read-only. Exactly one job escalates to
+# contents: write via a job-level permissions block: `create-release`,
+# which runs no third-party code — only SHA-pinned official actions and
+# the runner's own `gh`. Every job that downloads or executes the
+# third-party cargo-dist binary (`plan`, the build jobs, `host`) runs
+# read-only, so a compromised dist release never shares a runner or a
+# job token with write authority. With GitHub-only hosting, `dist plan` /
+# `dist host` perform no GitHub writes themselves.
 permissions:
   "contents": "read"
 
@@ -266,13 +267,14 @@ jobs:
       - build-global-artifacts
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
     if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
-    # Needs contents:write for the `gh release create` step below. The
-    # write-capable GH_TOKEN is scoped to that single step (not job-wide),
-    # so the cached third-party `dist` binary executed in the `host` step
-    # never runs with a write token — with GitHub-only hosting, `dist host`
-    # performs no GitHub uploads itself.
+    # Read-only: this job executes the cached third-party `dist` binary,
+    # so it must never hold a write-capable job token. With GitHub-only
+    # hosting, `dist host --steps=upload --steps=release` performs no
+    # GitHub uploads itself — the actual release is created by the
+    # separate, write-scoped `create-release` job below, which runs no
+    # third-party code.
     permissions:
-      "contents": "write"
+      "contents": "read"
     env:
       # Passed as an env var and only ever referenced as a quoted shell
       # variable below, never spliced into run: text.
@@ -317,7 +319,24 @@ jobs:
           # Overwrite the previous copy
           name: artifacts-dist-manifest
           path: dist-manifest.json
-      # Create a GitHub Release while uploading all files to it
+
+  # Creates the GitHub Release while uploading all files to it. This is
+  # deliberately a separate, minimal job: it is the only job in the
+  # workflow that holds a write-capable token, and it runs no third-party
+  # code — only SHA-pinned official actions and the runner's own `gh`
+  # (no checkout needed; GH_REPO tells gh where to publish). The
+  # third-party `dist` binary only ever executes in the read-only jobs
+  # above, so a compromised dist release can't poison the runner
+  # environment this job's token lives in.
+  create-release:
+    needs:
+      - plan
+      - host
+    if: ${{ always() && needs.host.result == 'success' && needs.plan.outputs.publishing == 'true' }}
+    permissions:
+      "contents": "write"
+    runs-on: "ubuntu-22.04"
+    steps:
       - name: "Download GitHub Artifacts"
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -330,13 +349,11 @@ jobs:
           rm -f artifacts/*-dist-manifest.json
       - name: Create GitHub Release
         env:
-          # The write-capable token lives only in this step's environment;
-          # every other step in this job (including the third-party `dist`
-          # binary) runs without it.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
-          ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
-          ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
+          GH_REPO: ${{ github.repository }}
+          PRERELEASE_FLAG: "${{ fromJson(needs.host.outputs.val).announcement_is_prerelease && '--prerelease' || '' }}"
+          ANNOUNCEMENT_TITLE: "${{ fromJson(needs.host.outputs.val).announcement_title }}"
+          ANNOUNCEMENT_BODY: "${{ fromJson(needs.host.outputs.val).announcement_github_body }}"
           RELEASE_COMMIT: "${{ github.sha }}"
           RELEASE_TAG: ${{ needs.plan.outputs.tag }}
         run: |
@@ -361,11 +378,10 @@ jobs:
     needs:
       - plan
       - host
-    # "host" must run to completion, no skipping allowed!
-    if: ${{ always() && needs.host.result == 'success' }}
+      - create-release
+    # "host" and "create-release" must run to completion, no skipping allowed!
+    if: ${{ always() && needs.host.result == 'success' && needs['create-release'].result == 'success' }}
     runs-on: "ubuntu-22.04"
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
