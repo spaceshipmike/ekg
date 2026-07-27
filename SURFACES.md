@@ -18,6 +18,7 @@ cross-cutting edge without looking like they do.
 | CI workflow | `.github/workflows/ci.yml` | change toolchain, test invocation, or platform matrix | both checks green; branch protection contexts still match job names |
 | Release workflow | `.github/workflows/release.yml` | change the release/publish pipeline (cargo-dist output or the hand-hardening on top of it) | reapply tag-as-quoted-env-var + full-SHA action pinning after any regen; `dist-workspace.toml` `allow-dirty = ["ci"]` still present; actionlint clean |
 | Homebrew tap | `spaceshipmike/homebrew-tap` (external repo, hand-maintained) | a tagged release ships new user-visible behavior, a flag, or completions/man-page support the formula should reflect | formula in the tap repo is updated by hand and matches the version/URL of a real GitHub Release |
+| Landing page | `docs/index.html` (GitHub Pages, served from `docs/` with `docs/demo.gif`) | change install commands, feature set, measured footprint numbers, or the demo GIF | page copy matches the README and the running binary; carries no version number (Cargo.toml is the only version source); footprint numbers re-measured against the current release |
 
 ## Cross-cutting edges (the silent ones)
 
