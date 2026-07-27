@@ -46,7 +46,7 @@
 
 ## Secrets / configuration
 
-- **ekg holds no secrets** — **PROSE**. No config files, no tokens, no network calls except ICMP to the user-named hosts. Hook commands run with the *user's* environment by design (minus reserved `EKG_*` vars). Implicit: nothing to scrub beyond the reserved-var scrub already tested.
+- **ekg holds no secrets** — **PROSE**. Scope: the CLI binary. No config files, no tokens, no network calls except ICMP to the user-named hosts. Hook commands run with the *user's* environment by design (minus reserved `EKG_*` vars). Implicit: nothing to scrub beyond the reserved-var scrub already tested. (The landing page — a separate surface, not the binary — reports pageviews to the operator's self-hosted umami instance; see SURFACES.md.)
 
 ## CI / dev workflow
 
