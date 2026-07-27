@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ekg — the machine that goes ping</title>
+<meta name="description" content="ekg is a compact command-line ping monitor. It redraws a two-line panel in place: latency, a sparkline, jitter, loss, and uptime.">
+<style>
+  html { background: #0a0a0f; }
+  body { margin: 0; background: #0a0a0f; color: #dcdce4; font-family: "JetBrains Mono", "IBM Plex Mono", "Cascadia Code", "Berkeley Mono", "SF Mono", SFMono-Regular, ui-monospace, Menlo, Consolas, "DejaVu Sans Mono", monospace; font-feature-settings: "ss02", "calt", "liga"; -webkit-font-smoothing: antialiased; }
+  * { box-sizing: border-box; }
+  a { color: #ff4d9d; text-decoration: none; border-bottom: 1px solid rgba(255,77,157,0.35); }
+  a:hover { color: #ff85bd; border-bottom-color: #ff85bd; }
+  .copy-btn { flex: none; border: 1px solid #33333f; background: transparent; color: #ff4d9d; font: inherit; font-size: 12px; padding: 3px 10px; border-radius: 4px; cursor: pointer; }
+  .copy-btn:hover { border-color: #ff4d9d; }
+  @keyframes ekgsweep { from { stroke-dashoffset: 1200; } to { stroke-dashoffset: 0; } }
+</style>
+</head>
+<body>
+<div style="max-width: 820px; margin: 0 auto; padding: 0 24px 96px; font-size: 15px; line-height: 1.7;">
+
+  <header style="padding: 88px 0 0;">
+    <div style="display: flex; align-items: baseline; gap: 14px;">
+      <h1 style="margin: 0; font-size: 42px; letter-spacing: -0.03em; font-weight: 600; color: #f4f4f8;">ekg</h1>
+      <span style="font-size: 12px; color: #7c7c8c; letter-spacing: 0.08em;">v0.2.0 · rust · mit / apache-2.0</span>
+    </div>
+    <p style="margin: 18px 0 0; font-size: 20px; line-height: 1.5; color: #ff4d9d; max-width: 30ch; text-wrap: pretty;">The machine that goes <a href="https://www.youtube.com/watch?v=VQPIdZvoV4g" target="_blank" rel="noopener" style="color: inherit; border-bottom-color: rgba(255,77,157,0.45);">PING!</a> — without the wall of scrolling text.</p>
+    <p style="margin: 24px 0 0; max-width: 62ch; color: #adadbb; text-wrap: pretty;">ekg pings your hosts and redraws two lines in place: current latency, a sparkline, and running stats for jitter, loss, and uptime. It runs all day in the corner of a tmux pane. Your scrollback stays usable.</p>
+
+    <svg viewBox="0 0 1200 80" preserveAspectRatio="none" aria-hidden="true" style="display: block; width: 100%; height: 52px; margin: 40px 0 0; overflow: visible;">
+      <polyline points="0,40 220,40 250,40 262,18 274,62 286,30 298,40 520,40 560,40 572,18 584,62 596,30 608,40 860,40 900,40 912,18 924,62 936,30 948,40 1200,40" fill="none" stroke="#ff4d9d" stroke-width="1.5" stroke-linejoin="round" stroke-dasharray="1200" style="animation: ekgsweep 3.2s ease-out both; opacity: 0.55;"></polyline>
+    </svg>
+  </header>
+
+  <figure style="margin: 40px 0 0; border: 1px solid #242430; border-radius: 6px; background: #101017; overflow: hidden;">
+    <div style="display: flex; gap: 7px; align-items: center; padding: 10px 14px; border-bottom: 1px solid #242430; background: #101017;">
+      <span style="width: 9px; height: 9px; border-radius: 50%; background: #33333f; display: block;"></span>
+      <span style="width: 9px; height: 9px; border-radius: 50%; background: #33333f; display: block;"></span>
+      <span style="width: 9px; height: 9px; border-radius: 50%; background: #33333f; display: block;"></span>
+      <span style="margin-left: 8px; font-size: 12px; color: #7c7c8c;">ekg 1.1.1.1</span>
+    </div>
+    <img src="demo.gif" alt="ekg demo: a live ping panel, then an outage being declared against an unreachable host" style="display: block; width: 100%; height: auto; background: #101017;">
+  </figure>
+
+  <section style="margin: 96px 0 0;">
+    <h2 style="margin: 0 0 6px; font-size: 13px; letter-spacing: 0.18em; text-transform: uppercase; color: #7c7c8c; font-weight: 500;">Install</h2>
+    <div style="display: flex; flex-direction: column; gap: 10px; margin-top: 20px;">
+      <div style="display: flex; align-items: flex-start; gap: 12px; border: 1px solid #242430; border-radius: 5px; background: #101017; padding: 14px 14px 14px 16px;">
+        <code style="flex: 1; min-width: 0; font-size: 14px; color: #dcdce4; overflow-wrap: anywhere; line-height: 1.6;"><span style="color: #5a5a6a; user-select: none;">$ </span>brew install spaceshipmike/tap/ekg</code>
+        <button class="copy-btn" data-copy="brew install spaceshipmike/tap/ekg">copy</button>
+      </div>
+      <div style="display: flex; align-items: flex-start; gap: 12px; border: 1px solid #242430; border-radius: 5px; background: #101017; padding: 14px 14px 14px 16px;">
+        <code style="flex: 1; min-width: 0; font-size: 14px; color: #dcdce4; overflow-wrap: anywhere; line-height: 1.6;"><span style="color: #5a5a6a; user-select: none;">$ </span>cargo install ekg</code>
+        <button class="copy-btn" data-copy="cargo install ekg">copy</button>
+      </div>
+      <div style="display: flex; align-items: flex-start; gap: 12px; border: 1px solid #242430; border-radius: 5px; background: #101017; padding: 14px 14px 14px 16px;">
+        <code style="flex: 1; min-width: 0; font-size: 14px; color: #dcdce4; overflow-wrap: anywhere; line-height: 1.6;"><span style="color: #5a5a6a; user-select: none;">$ </span>curl --proto '=https' --tlsv1.2 -LsSf https://github.com/spaceshipmike/ekg/releases/latest/download/ekg-installer.sh | sh</code>
+        <button class="copy-btn" data-copy="curl --proto '=https' --tlsv1.2 -LsSf https://github.com/spaceshipmike/ekg/releases/latest/download/ekg-installer.sh | sh">copy</button>
+      </div>
+    </div>
+  </section>
+
+  <section style="margin: 96px 0 0;">
+    <h2 style="margin: 0 0 6px; font-size: 13px; letter-spacing: 0.18em; text-transform: uppercase; color: #7c7c8c; font-weight: 500;">Features</h2>
+    <ul style="list-style: none; margin: 20px 0 0; padding: 0; display: flex; flex-direction: column; gap: 12px; max-width: 66ch;">
+      <li style="display: flex; gap: 14px; color: #adadbb;"><span style="color: #ff4d9d; flex: none;">—</span><span>watches multiple hosts in one panel</span></li>
+      <li style="display: flex; gap: 14px; color: #adadbb;"><span style="color: #ff4d9d; flex: none;">—</span><span>declares an outage when replies stop, and keeps a running count of how long you've been down</span></li>
+      <li style="display: flex; gap: 14px; color: #adadbb;"><span style="color: #ff4d9d; flex: none;">—</span><span>runs your commands on outage and recovery (--on-outage / --on-recovery)</span></li>
+      <li style="display: flex; gap: 14px; color: #adadbb;"><span style="color: #ff4d9d; flex: none;">—</span><span>writes every sample and outage event to a log you can grep later</span></li>
+      <li style="display: flex; gap: 14px; color: #adadbb;"><span style="color: #ff4d9d; flex: none;">—</span><span>works in scripts: --count and --max-loss give cron an exit code it can act on</span></li>
+      <li style="display: flex; gap: 14px; color: #adadbb;"><span style="color: #ff4d9d; flex: none;">—</span><span>ships bash/zsh/fish completions and a man page</span></li>
+      <li style="display: flex; gap: 14px; color: #adadbb;"><span style="color: #ff4d9d; flex: none;">—</span><span>one binary for macOS and Linux, x86_64 and arm64</span></li>
+    </ul>
+  </section>
+
+  <section style="margin: 96px 0 0;">
+    <h2 style="margin: 0 0 6px; font-size: 13px; letter-spacing: 0.18em; text-transform: uppercase; color: #7c7c8c; font-weight: 500;">Why</h2>
+    <p style="margin: 20px 0 0; max-width: 62ch; color: #adadbb; text-wrap: pretty; font-size: 16px;">ping tells you everything and shows you nothing. After an hour it has printed 3,600 lines, and you still have to scroll back to find the gap where your router died. ekg keeps the answer on screen: is the network up, and when did it last break.</p>
+  </section>
+
+  <section style="margin: 96px 0 0;">
+    <h2 style="margin: 0 0 6px; font-size: 13px; letter-spacing: 0.18em; text-transform: uppercase; color: #7c7c8c; font-weight: 500;">Footprint</h2>
+    <p style="margin: 20px 0 0; max-width: 62ch; color: #adadbb; text-wrap: pretty; font-size: 16px;">About 2 MB on disk and 2.5 MB of RAM while it watches. That's roughly one megabyte more than ping itself. The fullscreen graphing tools run three times heavier.</p>
+    <div style="display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px 22px; margin-top: 28px; padding-top: 22px; border-top: 1px solid #242430;">
+      <span style="display: flex; align-items: baseline; gap: 8px;"><strong style="font-size: 24px; font-weight: 600; color: #ff4d9d; letter-spacing: -0.02em;">2 MB</strong><span style="font-size: 12px; color: #7c7c8c; letter-spacing: 0.06em;">binary</span></span>
+      <span style="color: #33333f;">·</span>
+      <span style="display: flex; align-items: baseline; gap: 8px;"><strong style="font-size: 24px; font-weight: 600; color: #ff4d9d; letter-spacing: -0.02em;">2.5 MB</strong><span style="font-size: 12px; color: #7c7c8c; letter-spacing: 0.06em;">RAM</span></span>
+      <span style="color: #33333f;">·</span>
+      <span style="display: flex; align-items: baseline; gap: 8px;"><strong style="font-size: 24px; font-weight: 600; color: #ff4d9d; letter-spacing: -0.02em;">0.5 MB</strong><span style="font-size: 12px; color: #7c7c8c; letter-spacing: 0.06em;">download</span></span>
+    </div>
+  </section>
+
+  <footer style="margin: 112px 0 0; padding-top: 26px; border-top: 1px solid #242430; display: flex; flex-wrap: wrap; gap: 8px 24px; font-size: 13px; color: #7c7c8c;">
+    <a href="https://github.com/spaceshipmike/ekg">github.com/spaceshipmike/ekg</a>
+    <span>MIT / Apache-2.0</span>
+    <span>built in Rust</span>
+  </footer>
+
+</div>
+<script>
+  document.querySelectorAll('.copy-btn').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var text = btn.getAttribute('data-copy');
+      var done = function () {
+        btn.textContent = 'copied';
+        clearTimeout(btn._t);
+        btn._t = setTimeout(function () { btn.textContent = 'copy'; }, 1600);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, done);
+      } else {
+        var ta = document.createElement('textarea');
+        ta.value = text; document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); } catch (e) {}
+        document.body.removeChild(ta); done();
+      }
+    });
+  });
+</script>
+</body>
+</html>
