@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ekg — the machine that goes ping</title>
-<meta name="description" content="ekg is a compact command-line ping monitor. It redraws a two-line panel in place: latency, a sparkline, jitter, loss, and uptime.">
+<meta name="description" content="ekg is a compact command-line ping monitor. It redraws a small panel in place: latency, a sparkline, jitter, loss, and uptime.">
 <style>
   html { background: #0a0a0f; }
   body { margin: 0; background: #0a0a0f; color: #dcdce4; font-family: "JetBrains Mono", "IBM Plex Mono", "Cascadia Code", "Berkeley Mono", "SF Mono", SFMono-Regular, ui-monospace, Menlo, Consolas, "DejaVu Sans Mono", monospace; font-feature-settings: "ss02", "calt", "liga"; -webkit-font-smoothing: antialiased; }
@@ -25,7 +25,7 @@
       <span style="font-size: 12px; color: #7c7c8c; letter-spacing: 0.08em;">rust · mit / apache-2.0</span>
     </div>
     <p style="margin: 18px 0 0; font-size: 20px; line-height: 1.5; color: #ff4d9d; max-width: 30ch; text-wrap: pretty;">The machine that goes <a href="https://www.youtube.com/watch?v=VQPIdZvoV4g" target="_blank" rel="noopener" style="color: inherit; border-bottom-color: rgba(255,77,157,0.45);">PING!</a> — without the wall of scrolling text.</p>
-    <p style="margin: 24px 0 0; max-width: 62ch; color: #adadbb; text-wrap: pretty;">ekg pings your hosts and redraws two lines in place: current latency, a sparkline, and running stats for jitter, loss, and uptime. It runs all day in the corner of a tmux pane. Your scrollback stays usable.</p>
+    <p style="margin: 24px 0 0; max-width: 62ch; color: #adadbb; text-wrap: pretty;">ekg pings your hosts and redraws a compact panel in place: a line per host with current latency and a sparkline, plus running stats for jitter, loss, and uptime. It runs all day in the corner of a tmux pane. Your scrollback stays usable.</p>
 
     <svg viewBox="0 0 1200 80" preserveAspectRatio="none" aria-hidden="true" style="display: block; width: 100%; height: 52px; margin: 40px 0 0; overflow: visible;">
       <polyline points="0,40 220,40 250,40 262,18 274,62 286,30 298,40 520,40 560,40 572,18 584,62 596,30 608,40 860,40 900,40 912,18 924,62 936,30 948,40 1200,40" fill="none" stroke="#ff4d9d" stroke-width="1.5" stroke-linejoin="round" stroke-dasharray="1200" style="animation: ekgsweep 3.2s ease-out both; opacity: 0.55;"></polyline>
